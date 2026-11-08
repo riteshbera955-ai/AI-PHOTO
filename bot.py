@@ -2,7 +2,7 @@ import os
 import io
 import asyncio
 import logging
-from PIL import Image
+from PIL import Image, ImageOps
 import replicate
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -11,6 +11,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "15"))
 MAX_BATCH_PHOTOS = int(os.getenv("MAX_BATCH_PHOTOS", "30"))
+
+# Fixed output profile based on the sample photo the user provided.
+OUTPUT_WIDTH = 1030
+OUTPUT_HEIGHT = 1536
+TARGET_FILE_SIZE_KB = 286
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -22,7 +27,8 @@ WELCOME = (
     "👋 Welcome to BROTHERS AI Photo Enhancer!\\n\\n"
     "Send multiple photos one by one or as an album. "
     "When finished, send /done to enhance the whole batch.\\n\\n"
-    "The enhanced output will keep each original photo's exact pixel dimensions. "
+    "Every output is exported as JPG at 1030 × 1536 px. "
+    "File size is targeted near 286 KB (it can vary with image detail).\\n"
     "Use /cancel to clear the current batch."
 )
 
@@ -37,15 +43,29 @@ def get_image_bytes(result):
             return bytes(item)
     raise RuntimeError("The AI service returned an unsupported output.")
 
-def enhance_image(image_bytes: bytes):
-    # AI enhancement/upscaling runs remotely. We resize the enhanced result
-    # back to the exact original width and height after inference.
-    with Image.open(io.BytesIO(image_bytes)) as original:
-        original.load()
-        original_size = original.size
-        original_format = (original.format or "JPEG").upper()
-        original_mode = original.mode
+def encode_jpeg_near_target(image: Image.Image):
+    """Choose the highest JPEG quality that stays near/below target size."""
+    target_bytes = TARGET_FILE_SIZE_KB * 1024
+    best_data = None
+    best_gap = float("inf")
 
+    # Try a range of JPEG quality values; size depends on image complexity.
+    for quality in range(95, 54, -2):
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=quality, optimize=True, progressive=True)
+        data = output.getvalue()
+        gap = abs(len(data) - target_bytes)
+        if gap < best_gap:
+            best_data = data
+            best_gap = gap
+        if len(data) <= target_bytes:
+            # First under-target result is generally the best quality under the cap.
+            return data
+
+    return best_data
+
+def enhance_image(image_bytes: bytes):
+    # Run AI enhancement remotely, then export to the requested fixed dimensions.
     result = replicate.run(
         "nightmareai/real-esrgan",
         input={
@@ -58,24 +78,17 @@ def enhance_image(image_bytes: bytes):
 
     with Image.open(io.BytesIO(enhanced_bytes)) as enhanced:
         enhanced.load()
-        if original_mode in ("RGBA", "LA") and original_format == "PNG":
-            enhanced = enhanced.convert("RGBA")
-        else:
-            enhanced = enhanced.convert("RGB")
-        enhanced = enhanced.resize(original_size, Image.Resampling.LANCZOS)
+        enhanced = ImageOps.exif_transpose(enhanced).convert("RGB")
 
-        output = io.BytesIO()
-        if original_format == "PNG":
-            enhanced.save(output, format="PNG", optimize=True)
-            extension = "png"
-        elif original_format == "WEBP":
-            enhanced.save(output, format="WEBP", quality=95, method=6)
-            extension = "webp"
-        else:
-            enhanced.save(output, format="JPEG", quality=95, optimize=True)
-            extension = "jpg"
+        # Exact 1030x1536 output. This resizes to the requested canvas;
+        # aspect ratios different from the sample may appear slightly stretched.
+        enhanced = enhanced.resize(
+            (OUTPUT_WIDTH, OUTPUT_HEIGHT),
+            Image.Resampling.LANCZOS
+        )
+        output_bytes = encode_jpeg_near_target(enhanced)
 
-        return output.getvalue(), extension, original_size
+    return output_bytes, (OUTPUT_WIDTH, OUTPUT_HEIGHT)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["batch"] = []
@@ -103,10 +116,7 @@ async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    batch.append({
-        "file_id": photo.file_id,
-        "file_name": getattr(message.document, "file_name", None) if message.document else None
-    })
+    batch.append({"file_id": photo.file_id})
     await message.reply_text(
         f"📥 Added to batch: {len(batch)}/{MAX_BATCH_PHOTOS} photos.\\n"
         "Send more photos or type /done to start enhancement."
@@ -119,7 +129,6 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Your batch is empty. Send some photos first.")
         return
 
-    # Clear current batch immediately so the user can start another batch later.
     context.user_data["batch"] = []
     status = await message.reply_text(f"🚀 Starting AI enhancement for {len(batch)} photos...")
     success, failed = 0, 0
@@ -132,15 +141,16 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             tg_file = await context.bot.get_file(item["file_id"])
             downloaded = await tg_file.download_as_bytearray()
-            enhanced, ext, dimensions = await asyncio.to_thread(
+            enhanced, dimensions = await asyncio.to_thread(
                 enhance_image, bytes(downloaded)
             )
             await message.reply_document(
                 document=io.BytesIO(enhanced),
-                filename=f"enhanced_{index}.{ext}",
+                filename=f"enhanced_{index}.jpg",
                 caption=(
                     f"✅ Enhanced photo {index}/{len(batch)}\\n"
-                    f"Original dimensions preserved: {dimensions[0]} × {dimensions[1]} px"
+                    f"Output dimensions: {dimensions[0]} × {dimensions[1]} px\\n"
+                    f"File size: {len(enhanced) / 1024:.1f} KB"
                 )
             )
             success += 1
@@ -179,4 +189,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-          
