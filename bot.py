@@ -3,6 +3,8 @@ import io
 import asyncio
 import logging
 import tempfile
+import time
+import threading
 from pathlib import Path
 
 import replicate
@@ -20,6 +22,14 @@ MAX_BATCH_PHOTOS = int(os.getenv("MAX_BATCH_PHOTOS", "20"))
 OUTPUT_LONG_EDGE = int(os.getenv("OUTPUT_LONG_EDGE", "3840"))
 GREY_RGB = (126, 126, 126)  # #7E7E7E
 
+# Replicate account limit in the user's logs: 6 prediction creations/minute.
+# Two models are called per photo, so keep at least 12 seconds between
+# prediction creation requests and retry throttled requests.
+MIN_SECONDS_BETWEEN_PREDICTIONS = 12
+MAX_RATE_LIMIT_RETRIES = 5
+_request_lock = threading.Lock()
+_last_prediction_started = 0.0
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -31,7 +41,6 @@ if REPLICATE_API_TOKEN:
 
 
 def output_to_bytes(output):
-    """Handle Replicate FileOutput, bytes, or a list of file outputs."""
     if isinstance(output, (bytes, bytearray)):
         return bytes(output)
     if hasattr(output, "read"):
@@ -40,7 +49,7 @@ def output_to_bytes(output):
         return output_to_bytes(output[0])
     if isinstance(output, str) and output.startswith("http"):
         import requests
-        response = requests.get(output, timeout=120)
+        response = requests.get(output, timeout=180)
         response.raise_for_status()
         return response.content
     raise RuntimeError(
@@ -48,24 +57,55 @@ def output_to_bytes(output):
     )
 
 
+def is_rate_limit_error(exc):
+    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+    message = str(exc).lower()
+    return status == 429 or "429" in message or "throttl" in message or "rate limit" in message
+
+
 def run_replicate_model(model_name, image_path, input_data):
-    """Pass an opened file so Replicate uploads it with the correct auth."""
-    with open(image_path, "rb") as source:
-        payload = dict(input_data)
-        payload["image"] = source
-        result = replicate.run(model_name, input=payload)
-    return output_to_bytes(result)
+    """Rate-limited Replicate call with exponential retry on HTTP 429."""
+    global _last_prediction_started
+
+    with _request_lock:
+        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+            elapsed = time.monotonic() - _last_prediction_started
+            wait_for_gap = MIN_SECONDS_BETWEEN_PREDICTIONS - elapsed
+            if wait_for_gap > 0:
+                log.info("Rate-limit spacing: waiting %.1f seconds", wait_for_gap)
+                time.sleep(wait_for_gap)
+
+            try:
+                with open(image_path, "rb") as source:
+                    payload = dict(input_data)
+                    payload["image"] = source
+                    _last_prediction_started = time.monotonic()
+                    result = replicate.run(model_name, input=payload)
+                return output_to_bytes(result)
+
+            except Exception as exc:
+                if not is_rate_limit_error(exc) or attempt >= MAX_RATE_LIMIT_RETRIES:
+                    raise
+
+                # Backoff: 15, 30, 60, 90, 120 seconds.
+                delay = min(15 * (2 ** attempt), 120)
+                log.warning(
+                    "Replicate rate limit for %s; retry %s/%s in %s seconds",
+                    model_name, attempt + 1, MAX_RATE_LIMIT_RETRIES, delay
+                )
+                time.sleep(delay)
+
+    raise RuntimeError("Replicate request could not be completed after retries.")
 
 
 def enhance_and_remove_background(original_bytes):
-    """4x upscale, remove old background, composite neutral grey, export JPG."""
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_dir = Path(temp_dir)
         source_path = temp_dir / "input_image"
         source_path.write_bytes(original_bytes)
 
-        # 1) Restore/upscale without GFPGAN so facial features are less likely
-        # to be altered. The model's 4x scale is used.
+        # Model 1: 4x enhancement. Face restoration stays disabled to reduce
+        # the chance of changing identity/facial details.
         upscaled = run_replicate_model(
             "nightmareai/real-esrgan",
             source_path,
@@ -75,14 +115,13 @@ def enhance_and_remove_background(original_bytes):
         upscale_path = temp_dir / "upscaled.png"
         upscale_path.write_bytes(upscaled)
 
-        # 2) Remove the original background and preserve transparency.
+        # Model 2: remove original background and preserve alpha.
         transparent = run_replicate_model(
             "bria/remove-background",
             upscale_path,
             {"preserve_alpha": True, "content_moderation": False}
         )
 
-        # 3) Composite on grey. Keep entire frame and aspect ratio.
         with Image.open(io.BytesIO(transparent)) as im:
             im.load()
             subject = ImageOps.exif_transpose(im).convert("RGBA")
@@ -112,10 +151,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["batch"] = []
     await update.effective_message.reply_text(
         "👋 BROTHERS AI PHOTO ENHANCER\n\n"
-        "Send photos one by one or as an album. Then send /done.\n\n"
-        "The bot will upscale the photo, remove its old background, "
-        "place the subject on neutral grey (#7E7E7E), and return a "
-        "high-quality JPG with the full frame preserved.\n\n"
+        "Send photos one by one or as an album, then send /done.\n"
+        "Processing is sequential with automatic waiting/retry for API rate limits.\n\n"
         "/done — process queued photos\n"
         "/cancel — clear the queue\n"
         "/status — check bot status"
@@ -128,11 +165,9 @@ async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not media:
         return
-
     if msg.document and msg.document.mime_type and not msg.document.mime_type.startswith("image/"):
         await msg.reply_text("Please send an image file (JPG, PNG, or WEBP).")
         return
-
     if media.file_size and media.file_size > MAX_UPLOAD_MB * 1024 * 1024:
         await msg.reply_text(f"Image is too large. Maximum upload: {MAX_UPLOAD_MB} MB.")
         return
@@ -158,7 +193,6 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not batch:
         await msg.reply_text("No photos queued. Send photos first.")
         return
-
     if not REPLICATE_API_TOKEN:
         await msg.reply_text(
             "❌ Server setup error: REPLICATE_API_TOKEN is missing in Render Environment."
@@ -166,15 +200,19 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["batch"] = []
-    status = await msg.reply_text(f"⏳ Starting {len(batch)} photo(s)...")
+    status_msg = await msg.reply_text(
+        f"⏳ Starting {len(batch)} photo(s).\n"
+        "The bot will wait automatically if Replicate rate-limits a request."
+    )
     success = 0
     failed = 0
 
     for index, file_id in enumerate(batch, start=1):
         try:
-            await status.edit_text(
+            await status_msg.edit_text(
                 f"⏳ Processing photo {index}/{len(batch)}\n"
-                f"✅ Completed: {success} | ❌ Failed: {failed}"
+                f"✅ Completed: {success} | ❌ Failed: {failed}\n"
+                "API requests are spaced out to respect the rate limit."
             )
 
             tg_file = await context.bot.get_file(file_id)
@@ -191,7 +229,7 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✅ Enhanced photo {index}/{len(batch)}\n"
                     f"Output: {dimensions[0]} × {dimensions[1]} px\n"
                     "Background: Grey (#7E7E7E)\n"
-                    "Full frame retained; face enhancement filter disabled."
+                    "Full frame retained; no intentional crop or stretch."
                 )
             )
             success += 1
@@ -199,15 +237,16 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as exc:
             failed += 1
             log.exception("Photo %s processing failed", index)
-            # Return a useful but safe error hint without exposing credentials.
-            error_text = str(exc).replace(REPLICATE_API_TOKEN, "[hidden token]") if REPLICATE_API_TOKEN else str(exc)
+            error_text = str(exc)
+            if REPLICATE_API_TOKEN:
+                error_text = error_text.replace(REPLICATE_API_TOKEN, "[hidden token]")
             await msg.reply_text(
                 f"❌ Photo {index} failed.\n"
-                f"Error: {error_text[:700]}\n"
+                f"Error: {error_text[:600]}\n"
                 "Check Render Logs for the full traceback."
             )
 
-    await status.edit_text(
+    await status_msg.edit_text(
         f"🏁 Batch finished!\n"
         f"✅ Successful: {success}\n"
         f"❌ Failed: {failed}\n\n"
