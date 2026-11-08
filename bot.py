@@ -20,7 +20,7 @@ REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "").strip()
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "15"))
 MAX_BATCH_PHOTOS = int(os.getenv("MAX_BATCH_PHOTOS", "20"))
 OUTPUT_LONG_EDGE = int(os.getenv("OUTPUT_LONG_EDGE", "3840"))
-GREY_RGB = (126, 126, 126)  # #7E7E7E
+GREY_RGB = (128, 128, 128)  # smooth, uniform matte grey (#808080)
 
 # Replicate account limit in the user's logs: 6 prediction creations/minute.
 # Two models are called per photo, so keep at least 12 seconds between
@@ -139,7 +139,7 @@ def enhance_and_remove_background(original_bytes):
 
         # Gently soften the alpha edge to reduce harsh cutout outlines around
         # hair and shoulders without cropping or changing the subject shape.
-        alpha = subject.getchannel("A").filter(ImageFilter.GaussianBlur(radius=0.55))
+        alpha = subject.getchannel("A").filter(ImageFilter.GaussianBlur(radius=0.9))
         subject.putalpha(alpha)
 
         width, height = subject.size
@@ -151,6 +151,8 @@ def enhance_and_remove_background(original_bytes):
         if new_size != subject.size:
             subject = subject.resize(new_size, Image.Resampling.LANCZOS)
 
+        # Always composite onto one perfectly uniform matte-grey canvas.
+        # This avoids gradients, texture, shadows, or leftover source-background patches.
         canvas = Image.new("RGBA", new_size, GREY_RGB + (255,))
         canvas.alpha_composite(subject)
         final_image = canvas.convert("RGB")
@@ -248,7 +250,7 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=(
                     f"✅ Enhanced photo {index}/{len(batch)}\n"
                     f"Output: {dimensions[0]} × {dimensions[1]} px\n"
-                    "Background: Grey (#7E7E7E)\n"
+                    "Background: Smooth matte grey (#808080)\n"
                     "Full frame retained; no intentional crop or stretch."
                 )
             )
