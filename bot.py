@@ -118,8 +118,10 @@ def enhance_and_remove_background(original_bytes):
 
         # Model 1: conservative face restoration. A high fidelity value keeps
         # the result closer to the input instead of aggressively redesigning it.
+        # CodeFormer is a community model, so Replicate requires a pinned
+        # version identifier rather than the unversioned owner/model slug.
         restored = run_replicate_model(
-            "sczhou/codeformer",
+            "sczhou/codeformer:cc4956dd26fa5a7185d5660cc9100fab1b8070a1d1654a8bb5eb6d443b020bb2",
             source_path,
             {
                 "codeformer_fidelity": CODEFORMER_FIDELITY,
