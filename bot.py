@@ -20,6 +20,7 @@ REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "").strip()
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "15"))
 MAX_BATCH_PHOTOS = int(os.getenv("MAX_BATCH_PHOTOS", "20"))
 OUTPUT_LONG_EDGE = int(os.getenv("OUTPUT_LONG_EDGE", "3840"))
+CODEFORMER_FIDELITY = float(os.getenv("CODEFORMER_FIDELITY", "0.80"))
 GREY_RGB = (128, 128, 128)  # smooth, uniform matte grey (#808080)
 
 # Replicate account limit in the user's logs: 6 prediction creations/minute.
@@ -74,7 +75,7 @@ def _retry_after_seconds(exc, fallback):
         return fallback
 
 
-def run_replicate_model(model_name, image_path, input_data):
+def run_replicate_model(model_name, image_path, input_data, image_field="image"):
     """Serialize Replicate calls and retry throttling without losing a batch."""
     global _last_prediction_started
 
@@ -89,7 +90,7 @@ def run_replicate_model(model_name, image_path, input_data):
             try:
                 with open(image_path, "rb") as source:
                     payload = dict(input_data)
-                    payload["image"] = source
+                    payload[image_field] = source
                     _last_prediction_started = time.monotonic()
                     result = replicate.run(model_name, input=payload)
                 return output_to_bytes(result)
@@ -115,18 +116,45 @@ def enhance_and_remove_background(original_bytes):
         source_path = temp_dir / "input_image"
         source_path.write_bytes(original_bytes)
 
-        # Model 1: 4x enhancement. Face restoration is deliberately disabled
-        # to reduce identity drift and avoid inventing facial features.
+        # Model 1: conservative face restoration. A high fidelity value keeps
+        # the result closer to the input instead of aggressively redesigning it.
+        restored = run_replicate_model(
+            "sczhou/codeformer",
+            source_path,
+            {
+                "codeformer_fidelity": CODEFORMER_FIDELITY,
+                "background_enhance": False,
+                "face_upsample": True,
+                "upscale": 2,
+            },
+            image_field="image",
+        )
+        restored_path = temp_dir / "face_restored.png"
+        restored_path.write_bytes(restored)
+
+        # Model 2: general 4x upscaling, with face enhancement disabled so it
+        # does not run a second, more aggressive face-restoration pass.
         upscaled = run_replicate_model(
             "nightmareai/real-esrgan",
-            source_path,
+            restored_path,
             {"scale": 4, "face_enhance": False}
         )
-
         upscale_path = temp_dir / "upscaled.png"
         upscale_path.write_bytes(upscaled)
 
-        # Model 2: remove original background and preserve alpha.
+        # Limit the intermediate image before background removal to avoid
+        # unnecessarily huge API inputs; final output is still 4K long-edge.
+        with Image.open(upscale_path) as up_im:
+            up_im = ImageOps.exif_transpose(up_im).convert("RGB")
+            cap = OUTPUT_LONG_EDGE / max(up_im.size)
+            if cap < 1:
+                up_im = up_im.resize(
+                    (max(1, round(up_im.width * cap)), max(1, round(up_im.height * cap))),
+                    Image.Resampling.LANCZOS,
+                )
+            up_im.save(upscale_path, format="PNG", optimize=True)
+
+        # Model 3: remove background and preserve alpha for a clean grey composite.
         transparent = run_replicate_model(
             "bria/remove-background",
             upscale_path,
@@ -173,7 +201,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "👋 BROTHERS AI PHOTO ENHANCER\n\n"
         "Send photos one by one or as an album, then send /done.\n"
-        "Output: natural face detail, grey background and up to 4K long-edge resolution.\n"
+        "Output: conservative face restoration, 4x upscaling and smooth grey background.\n"
         "Processing is sequential with automatic waiting/retry for API rate limits.\n\n"
         "/done — process queued photos\n"
         "/cancel — clear the queue\n"
@@ -251,6 +279,7 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✅ Enhanced photo {index}/{len(batch)}\n"
                     f"Output: {dimensions[0]} × {dimensions[1]} px\n"
                     "Background: Smooth matte grey (#808080)\n"
+                    f"Face restoration fidelity: {CODEFORMER_FIDELITY:.2f}\n"
                     "Full frame retained; no intentional crop or stretch."
                 )
             )
