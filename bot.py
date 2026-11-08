@@ -8,7 +8,7 @@ import threading
 from pathlib import Path
 
 import replicate
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -104,12 +104,13 @@ def enhance_and_remove_background(original_bytes):
         source_path = temp_dir / "input_image"
         source_path.write_bytes(original_bytes)
 
-        # Model 1: 4x enhancement. Face restoration stays disabled to reduce
-        # the chance of changing identity/facial details.
+        # Model 1: 4x enhancement with face restoration enabled.
+        # This can improve eyes/facial clarity, but very blurry source details
+        # cannot be recovered perfectly and AI restoration may make small changes.
         upscaled = run_replicate_model(
             "nightmareai/real-esrgan",
             source_path,
-            {"scale": 4, "face_enhance": False}
+            {"scale": 4, "face_enhance": True}
         )
 
         upscale_path = temp_dir / "upscaled.png"
@@ -126,6 +127,11 @@ def enhance_and_remove_background(original_bytes):
             im.load()
             subject = ImageOps.exif_transpose(im).convert("RGBA")
 
+        # Gently soften the alpha edge to reduce harsh cutout outlines around
+        # hair and shoulders without cropping or changing the subject shape.
+        alpha = subject.getchannel("A").filter(ImageFilter.GaussianBlur(radius=0.7))
+        subject.putalpha(alpha)
+
         width, height = subject.size
         factor = OUTPUT_LONG_EDGE / max(width, height)
         new_size = (
@@ -138,6 +144,8 @@ def enhance_and_remove_background(original_bytes):
         canvas = Image.new("RGBA", new_size, GREY_RGB + (255,))
         canvas.alpha_composite(subject)
         final_image = canvas.convert("RGB")
+        # Mild final sharpening helps retain fabric/hair detail after resizing.
+        final_image = ImageEnhance.Sharpness(final_image).enhance(1.12)
 
         output = io.BytesIO()
         final_image.save(
