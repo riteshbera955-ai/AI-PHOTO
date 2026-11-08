@@ -25,8 +25,8 @@ GREY_RGB = (126, 126, 126)  # #7E7E7E
 # Replicate account limit in the user's logs: 6 prediction creations/minute.
 # Two models are called per photo, so keep at least 12 seconds between
 # prediction creation requests and retry throttled requests.
-MIN_SECONDS_BETWEEN_PREDICTIONS = 12
-MAX_RATE_LIMIT_RETRIES = 5
+MIN_SECONDS_BETWEEN_PREDICTIONS = 15
+MAX_RATE_LIMIT_RETRIES = 6
 _request_lock = threading.Lock()
 _last_prediction_started = 0.0
 
@@ -63,8 +63,19 @@ def is_rate_limit_error(exc):
     return status == 429 or "429" in message or "throttl" in message or "rate limit" in message
 
 
+def _retry_after_seconds(exc, fallback):
+    """Read Retry-After when the SDK exposes response headers."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    value = headers.get("Retry-After") or headers.get("retry-after")
+    try:
+        return max(float(value), 1.0) if value is not None else fallback
+    except (TypeError, ValueError):
+        return fallback
+
+
 def run_replicate_model(model_name, image_path, input_data):
-    """Rate-limited Replicate call with exponential retry on HTTP 429."""
+    """Serialize Replicate calls and retry throttling without losing a batch."""
     global _last_prediction_started
 
     with _request_lock:
@@ -72,7 +83,7 @@ def run_replicate_model(model_name, image_path, input_data):
             elapsed = time.monotonic() - _last_prediction_started
             wait_for_gap = MIN_SECONDS_BETWEEN_PREDICTIONS - elapsed
             if wait_for_gap > 0:
-                log.info("Rate-limit spacing: waiting %.1f seconds", wait_for_gap)
+                log.info("Replicate request spacing: waiting %.1f seconds", wait_for_gap)
                 time.sleep(wait_for_gap)
 
             try:
@@ -87,10 +98,10 @@ def run_replicate_model(model_name, image_path, input_data):
                 if not is_rate_limit_error(exc) or attempt >= MAX_RATE_LIMIT_RETRIES:
                     raise
 
-                # Backoff: 15, 30, 60, 90, 120 seconds.
-                delay = min(15 * (2 ** attempt), 120)
+                fallback = min(20 * (2 ** attempt), 180)
+                delay = _retry_after_seconds(exc, fallback)
                 log.warning(
-                    "Replicate rate limit for %s; retry %s/%s in %s seconds",
+                    "Replicate rate limit for %s; retry %s/%s in %.1f seconds",
                     model_name, attempt + 1, MAX_RATE_LIMIT_RETRIES, delay
                 )
                 time.sleep(delay)
@@ -104,13 +115,12 @@ def enhance_and_remove_background(original_bytes):
         source_path = temp_dir / "input_image"
         source_path.write_bytes(original_bytes)
 
-        # Model 1: 4x enhancement with face restoration enabled.
-        # This can improve eyes/facial clarity, but very blurry source details
-        # cannot be recovered perfectly and AI restoration may make small changes.
+        # Model 1: 4x enhancement. Face restoration is deliberately disabled
+        # to reduce identity drift and avoid inventing facial features.
         upscaled = run_replicate_model(
             "nightmareai/real-esrgan",
             source_path,
-            {"scale": 4, "face_enhance": True}
+            {"scale": 4, "face_enhance": False}
         )
 
         upscale_path = temp_dir / "upscaled.png"
@@ -129,7 +139,7 @@ def enhance_and_remove_background(original_bytes):
 
         # Gently soften the alpha edge to reduce harsh cutout outlines around
         # hair and shoulders without cropping or changing the subject shape.
-        alpha = subject.getchannel("A").filter(ImageFilter.GaussianBlur(radius=0.7))
+        alpha = subject.getchannel("A").filter(ImageFilter.GaussianBlur(radius=0.55))
         subject.putalpha(alpha)
 
         width, height = subject.size
@@ -144,8 +154,9 @@ def enhance_and_remove_background(original_bytes):
         canvas = Image.new("RGBA", new_size, GREY_RGB + (255,))
         canvas.alpha_composite(subject)
         final_image = canvas.convert("RGB")
-        # Mild final sharpening helps retain fabric/hair detail after resizing.
-        final_image = ImageEnhance.Sharpness(final_image).enhance(1.12)
+        # Mild contrast and sharpening retain texture without over-smoothing skin.
+        final_image = ImageEnhance.Contrast(final_image).enhance(1.03)
+        final_image = ImageEnhance.Sharpness(final_image).enhance(1.15)
 
         output = io.BytesIO()
         final_image.save(
@@ -160,6 +171,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "👋 BROTHERS AI PHOTO ENHANCER\n\n"
         "Send photos one by one or as an album, then send /done.\n"
+        "Output: natural face detail, grey background and up to 4K long-edge resolution.\n"
         "Processing is sequential with automatic waiting/retry for API rate limits.\n\n"
         "/done — process queued photos\n"
         "/cancel — clear the queue\n"
@@ -220,7 +232,7 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text(
                 f"⏳ Processing photo {index}/{len(batch)}\n"
                 f"✅ Completed: {success} | ❌ Failed: {failed}\n"
-                "API requests are spaced out to respect the rate limit."
+                "API requests are spaced out; throttled requests retry automatically."
             )
 
             tg_file = await context.bot.get_file(file_id)
@@ -250,8 +262,9 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 error_text = error_text.replace(REPLICATE_API_TOKEN, "[hidden token]")
             await msg.reply_text(
                 f"❌ Photo {index} failed.\n"
-                f"Error: {error_text[:600]}\n"
-                "Check Render Logs for the full traceback."
+                f"Error: {error_text[:450]}\n"
+                "If this is an API rate/credit limit, the bot has retried automatically. "
+                "Check Replicate Billing/Usage and Render Logs."
             )
 
     await status_msg.edit_text(
