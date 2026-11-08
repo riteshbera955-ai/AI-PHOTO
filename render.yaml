@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: brothers-ai-photo-enhancer
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: REPLICATE_API_TOKEN
+        sync: false
+      - key: MAX_UPLOAD_MB
+        value: "15"
+      - key: MAX_BATCH_PHOTOS
+        value: "30"
