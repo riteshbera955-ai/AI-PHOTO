@@ -9,7 +9,7 @@ from pathlib import Path
 
 import replicate
 import requests
-from PIL import Image, ImageOps, ImageEnhance
+from PIL import Image, ImageOps
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -24,8 +24,7 @@ OUTPUT_WIDTH = int(os.getenv("OUTPUT_WIDTH", "1030"))
 OUTPUT_HEIGHT = int(os.getenv("OUTPUT_HEIGHT", "1536"))
 
 # Pinned, documented Replicate model versions.
-NAFNET_MODEL = "megvii-research/nafnet:e116b6df8437d9c562f9de2a86cea6fd76a96705e502f091457926bbe989436c"
-REALESRGAN_MODEL = "nightmareai/real-esrgan"
+SWIN2SR_MODEL = "mv-lab/swin2sr:a01b0512004918ca55d02e554914a9eca63909fa83a29ff0f115c78a7045574f"
 
 # Replicate account previously reported a low prediction-creation limit.
 MIN_SECONDS_BETWEEN_PREDICTIONS = 15
@@ -144,7 +143,7 @@ def fit_exact_canvas(image, width, height):
 
 
 def enhance_photo(original_bytes):
-    """Deblur the complete original frame, then upscale without face replacement."""
+    """Restore JPEG compression artifacts and upscale with one full-frame model."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         source_path = tmp / "input.jpg"
@@ -152,33 +151,19 @@ def enhance_photo(original_bytes):
         safe_path = tmp / "input_safe.jpg"
         make_safe_image(source_path, safe_path)
 
-        # Stage 1: NAFNet deblurring. The model returns the complete image frame.
-        nafnet_bytes = run_model(
-            NAFNET_MODEL,
+        # Swin2SR's documented task name for JPEG/compression restoration.
+        # It processes the complete frame; no face swap or background removal.
+        restored_bytes = run_model(
+            SWIN2SR_MODEL,
             safe_path,
-            {"task_type": "Image Debluring"},
-            image_field="image",
-        )
-        nafnet_path = tmp / "nafnet.png"
-        nafnet_path.write_bytes(nafnet_bytes)
-        nafnet_safe = tmp / "nafnet_safe.jpg"
-        make_safe_image(nafnet_path, nafnet_safe)
-
-        # Stage 2: Real-ESRGAN upscale; face_enhance=False avoids a separate
-        # face-generation pass and keeps the original background in the frame.
-        upscale_bytes = run_model(
-            REALESRGAN_MODEL,
-            nafnet_safe,
-            {"scale": 2, "face_enhance": False},
+            {"task": "compressed_sr"},
             image_field="image",
         )
 
-        with Image.open(io.BytesIO(upscale_bytes)) as im:
+        with Image.open(io.BytesIO(restored_bytes)) as im:
             im.load()
             final_image = fit_exact_canvas(im, OUTPUT_WIDTH, OUTPUT_HEIGHT)
 
-        # Very mild sharpening only; no invented background or facial details.
-        final_image = ImageEnhance.Sharpness(final_image).enhance(1.01)
         out = io.BytesIO()
         final_image.save(out, format="JPEG", quality=96, subsampling=0, optimize=True)
         return out.getvalue(), final_image.size
@@ -189,7 +174,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "👋 BROTHERS AI PHOTO RESTORER\n\n"
         "Send photos, then /done to process.\n"
-        "Models: NAFNet (full-frame deblurring) + Real-ESRGAN (upscaling).\n"
+        "Model: Swin2SR (JPEG compression restoration + super-resolution).\n"
         "Original scene/background is retained; no background removal.\n"
         f"Output: {OUTPUT_WIDTH} × {OUTPUT_HEIGHT} JPG.\n\n"
         "/done — process queued photos\n/cancel — clear queue\n/status — check status"
@@ -232,7 +217,7 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     processing_users.add(user_id)
     context.user_data["batch"] = []
-    status_msg = await msg.reply_text(f"⏳ Starting {len(batch)} photo(s) with NAFNet + Real-ESRGAN...")
+    status_msg = await msg.reply_text(f"⏳ Starting {len(batch)} photo(s) with Swin2SR...")
     success = 0
     failed = 0
     try:
@@ -241,7 +226,7 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status_msg.edit_text(
                     f"⏳ Processing photo {index}/{len(batch)}\n"
                     f"✅ Completed: {success} | ❌ Failed: {failed}\n"
-                    "Stage 1/2: full-frame deblurring; Stage 2/2: image upscaling."
+                    "Stage 1/1: full-frame compression restoration and super-resolution."
                 )
                 tg_file = await context.bot.get_file(file_id)
                 raw = bytes(await tg_file.download_as_bytearray())
@@ -252,7 +237,7 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=(
                         f"✅ Restored photo {index}/{len(batch)}\n"
                         f"Output: {dimensions[0]} × {dimensions[1]} px\n"
-                        "Models: NAFNet + Real-ESRGAN (face enhancement off)\n"
+                        "Model: Swin2SR (compressed_sr)\n"
                         "Original background retained; no background removal."
                     ),
                 )
