@@ -16,6 +16,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 BOT_TOKEN = os.getenv('BOT_TOKEN', '').strip()
 REPLICATE_API_TOKEN = os.getenv('REPLICATE_API_TOKEN', '').strip()
 MAX_UPLOAD_MB = int(os.getenv('MAX_UPLOAD_MB', '15'))
+OUTPUT_WIDTH = 1030
+OUTPUT_HEIGHT = 1536
 MAX_BATCH_PHOTOS = int(os.getenv('MAX_BATCH_PHOTOS', '20'))
 MIN_SECONDS_BETWEEN_CALLS = float(os.getenv('MIN_SECONDS_BETWEEN_CALLS', '12'))
 
@@ -81,7 +83,6 @@ def enhance_photo(original_bytes, make_passport=False):
         input_path.write_bytes(original_bytes)
         with Image.open(input_path) as im:
             original = ImageOps.exif_transpose(im).convert('RGB')
-            original_size = original.size
             normalized = td / 'normalized.jpg'
             original.save(normalized, 'JPEG', quality=96)
 
@@ -114,8 +115,11 @@ def enhance_photo(original_bytes, make_passport=False):
             dimensions = final.size
         else:
             # Retain the complete original frame and exact source dimensions; no border bars.
-            final = final.resize(original_size, Image.Resampling.LANCZOS)
-            dimensions = original_size
+            # Standard output size requested by the user. For source images already
+            # at 1030x1536 this does not change framing; other aspect ratios are
+            # resized to the same exact canvas size.
+            final = final.resize((OUTPUT_WIDTH, OUTPUT_HEIGHT), Image.Resampling.LANCZOS)
+            dimensions = (OUTPUT_WIDTH, OUTPUT_HEIGHT)
 
         out = io.BytesIO()
         final.save(out, 'JPEG', quality=95, subsampling=0, optimize=True)
@@ -129,9 +133,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         '👋 BROTHERS PHOTO RESTORER\n\n'
         'Send photos, then /done.\n'
         'Models: Bria Increase Resolution + GFPGAN v1.4.\n'
-        'Original background retained; no background removal.\n\n'
+        'Original background retained; no background removal.\n'
+        'Normal output: 1030 × 1536 px. Send images as File/Document for best quality.\n\n'
         '/passport — output 35x45mm (413x531 px) centered crop\n'
-        '/normal — retain original frame and dimensions\n'
+        '/normal — full frame, output 1030×1536 px\n'
         '/done — process queue\n/cancel — clear queue\n/status — status'
     )
 
@@ -143,7 +148,7 @@ async def passport(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def normal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['passport_mode'] = False
-    await update.effective_message.reply_text('Original-frame mode ON. Full photo and source dimensions will be retained.')
+    await update.effective_message.reply_text('Normal mode ON. Output will be 1030 × 1536 px; full frame/background retained.')
 
 
 async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -187,7 +192,7 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.reply_document(
                     document=io.BytesIO(result),
                     filename=f'brothers_restored_{i}.jpg',
-                    caption=(f'✅ Restored {i}/{len(batch)}\nOutput: {dims[0]} × {dims[1]} px\nModels: Bria + GFPGAN v1.4\n' + ('Passport crop: 35×45mm (centered; verify crop).' if passport_mode else 'Original frame/background retained; no background removal.'))
+                    caption=(f'✅ Restored {i}/{len(batch)}\nOutput: {dims[0]} × {dims[1]} px\nModels: Bria + GFPGAN v1.4\n' + ('Passport crop: 35×45mm (centered; verify crop).' if passport_mode else 'Full frame/background retained; output 1030×1536 px; no background removal.'))
                 )
                 success += 1
             except Exception as exc:
