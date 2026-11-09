@@ -156,7 +156,7 @@ def enhance_photo(original_bytes):
             SWINIR_MODEL,
             safe_path,
             {
-                "task_type": "Real-World Image Super-Resolution",
+                "task_type": "Real-World Image Super-Resolution-Large",
                 "noise": 15,
                 "jpeg": 40,
             },
