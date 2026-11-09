@@ -377,11 +377,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("processing"):
         current = context.user_data.get("progress", "Processing…")
-        await update.effective_message.reply_text(f"🟢 Bot is running.\\n⏳ {current}")
+        await update.effective_message.reply_text(f"🟢 Bot is running.\n⏳ {current}")
     else:
         queued = len(context.user_data.get("batch", []))
         await update.effective_message.reply_text(
-            f"🟢 Bot is running.\\n📥 Queued photos: {queued}\\nStatus: Idle"
+            f"🟢 Bot is running.\n📥 Queued photos: {queued}\nStatus: Idle"
         )
 
 
@@ -395,7 +395,8 @@ def main():
     if not REPLICATE_API_TOKEN:
         raise RuntimeError("REPLICATE_API_TOKEN is missing from Render Environment.")
 
-    # Run exactly one Render instance/worker for this polling bot token.\n    app = Application.builder().token(BOT_TOKEN).concurrent_updates(False).build()
+    # Run exactly one Render instance/worker for this polling bot token.
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(False).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("done", done))
     app.add_handler(CommandHandler("cancel", cancel))
