@@ -1,356 +1,362 @@
-#!/usr/bin/env python3
-"""
-KYC Portrait Generator – Clean & Working
-Uses:
-- CodeFormer (face restore)
-- Real-ESRGAN (upscale)
-- SD img2img (style transfer)
-- SD inpainting (add sindoor, bindi, jewellery)
-- Bria RMGB-1.4 (background removal)
-"""
-
-import asyncio
-import io
-import logging
 import os
+import io
+import asyncio
+import logging
 import tempfile
-import threading
 import time
+import threading
 from pathlib import Path
 
 import replicate
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters
+    Application, CommandHandler, MessageHandler,
+    ContextTypes, filters
 )
 
-# ---------- CONFIGURATION ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "").strip()
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "15"))
 MAX_BATCH_PHOTOS = int(os.getenv("MAX_BATCH_PHOTOS", "20"))
-OUTPUT_WIDTH = 1030
-OUTPUT_HEIGHT = 1536
-GREY_RGB = (128, 128, 128)
-GPU_MAX_PIXELS = 1_800_000
-CODEFORMER_FIDELITY = 0.98
+OUTPUT_WIDTH = int(os.getenv("OUTPUT_WIDTH", "1030"))
+OUTPUT_HEIGHT = int(os.getenv("OUTPUT_HEIGHT", "1536"))
+CODEFORMER_FIDELITY = float(os.getenv("CODEFORMER_FIDELITY", "0.98"))
 
-MIN_SEC_BETWEEN = 15
-MAX_RETRIES = 6
-_req_lock = threading.Lock()
-_last_pred = 0.0
+# Replicate account limit in the user's logs: 6 prediction creations/minute.
+# Two models are called per photo, so keep at least 12 seconds between
+# prediction creation requests and retry throttled requests.
+MIN_SECONDS_BETWEEN_PREDICTIONS = 15
+MAX_RATE_LIMIT_RETRIES = 6
+_request_lock = threading.Lock()
+_last_prediction_started = 0.0
 
-# Style prompts (match WA0009.jpg)
-STYLE_PROMPT = (
-    "A beautiful Indian woman wearing light grey dupatta with heavy gold embroidery "
-    "floral paisley, matching grey saree, sindoor in hair, red bindi, gold nose stud, "
-    "black-red beaded necklace, ornate gold pendant, studio portrait, grey background, "
-    "hyper-realistic, 8k, sharp focus, no watermark"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
-NEG_PROMPT = "watermark, logo, text, cartoon, 3d, blurry, ugly, blemish, scar"
+log = logging.getLogger("brothers-photo-bot")
 
-# Inpainting prompts for missing markers
-INPAINT_PROMPTS = {
-    "bindi": "bright red bindi on forehead, realistic",
-    "sindoor": "thick red sindoor in hair parting, natural",
-    "nose_stud": "small gold nose stud in left nostril",
-    "necklace": "black red beaded necklace, ornate gold pendant with white stone",
-}
-
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("kyc-bot")
 if REPLICATE_API_TOKEN:
     os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
 
 
-# ---------- HELPER FUNCTIONS ----------
-def gpu_safe(input_path, output_path, max_px=GPU_MAX_PIXELS):
-    with Image.open(input_path) as im:
-        im = ImageOps.exif_transpose(im).convert("RGB")
-        w, h = im.size
-        if w * h > max_px:
-            scale = (max_px / (w * h)) ** 0.5
-            im = im.resize((max(1, int(w*scale)), max(1, int(h*scale))), Image.Resampling.LANCZOS)
-        im.save(output_path, "JPEG", quality=95, optimize=True)
+# GPU-safe intermediate limit. Keep a margin below the 2,096,704-pixel
+# hardware limit reported by Replicate.
+GPU_MAX_PIXELS = int(os.getenv("GPU_MAX_PIXELS", "1800000"))
+
+
+def make_gpu_safe_image(input_path, output_path, max_pixels=GPU_MAX_PIXELS):
+    """Resize an image under the model GPU pixel limit without cropping."""
+    with Image.open(input_path) as image:
+        image = ImageOps.exif_transpose(image).convert("RGB")
+        width, height = image.size
+        pixels = width * height
+
+        if pixels > max_pixels:
+            scale = (max_pixels / float(pixels)) ** 0.5
+            new_size = (
+                max(1, int(width * scale)),
+                max(1, int(height * scale)),
+            )
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
+
+        image.save(output_path, format="JPEG", quality=95, optimize=True)
     return output_path
 
-def out_to_bytes(o):
-    if isinstance(o, (bytes, bytearray)): return bytes(o)
-    if hasattr(o, "read"): return o.read()
-    if isinstance(o, (list, tuple)) and o: return out_to_bytes(o[0])
-    if isinstance(o, str) and o.startswith("http"):
-        import requests; r = requests.get(o, timeout=180); r.raise_for_status(); return r.content
-    raise RuntimeError(f"Bad output type: {type(o)}")
 
-def is_rate_limit(exc):
-    return (getattr(exc, "status", None) == 429 or "429" in str(exc).lower())
+def output_to_bytes(output):
+    if isinstance(output, (bytes, bytearray)):
+        return bytes(output)
+    if hasattr(output, "read"):
+        return output.read()
+    if isinstance(output, (list, tuple)) and output:
+        return output_to_bytes(output[0])
+    if isinstance(output, str) and output.startswith("http"):
+        import requests
+        response = requests.get(output, timeout=180)
+        response.raise_for_status()
+        return response.content
+    raise RuntimeError(
+        f"Unexpected Replicate output type: {type(output).__name__}"
+    )
 
-def retry_after(exc, fallback):
-    resp = getattr(exc, "response", None)
-    val = (resp.headers or {}).get("Retry-After") if resp else None
-    try: return max(float(val), 1.0) if val else fallback
-    except: return fallback
 
-def run_model(model_ref, image_path, extra_inputs, image_field="image"):
-    global _last_pred
-    with _req_lock:
-        for attempt in range(MAX_RETRIES + 1):
-            gap = MIN_SEC_BETWEEN - (time.monotonic() - _last_pred)
-            if gap > 0: time.sleep(gap)
+def is_rate_limit_error(exc):
+    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+    message = str(exc).lower()
+    return status == 429 or "429" in message or "throttl" in message or "rate limit" in message
+
+
+def _retry_after_seconds(exc, fallback):
+    """Read Retry-After when the SDK exposes response headers."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    value = headers.get("Retry-After") or headers.get("retry-after")
+    try:
+        return max(float(value), 1.0) if value is not None else fallback
+    except (TypeError, ValueError):
+        return fallback
+
+
+def run_replicate_model(model_name, image_path, input_data, image_field="image"):
+    """Serialize Replicate calls and retry throttling without losing a batch."""
+    global _last_prediction_started
+
+    with _request_lock:
+        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+            elapsed = time.monotonic() - _last_prediction_started
+            wait_for_gap = MIN_SECONDS_BETWEEN_PREDICTIONS - elapsed
+            if wait_for_gap > 0:
+                log.info("Replicate request spacing: waiting %.1f seconds", wait_for_gap)
+                time.sleep(wait_for_gap)
+
             try:
-                with open(image_path, "rb") as f:
-                    payload = dict(extra_inputs)
-                    payload[image_field] = f
-                    _last_pred = time.monotonic()
-                    result = replicate.run(model_ref, input=payload)
-                return out_to_bytes(result)
-            except Exception as e:
-                if not is_rate_limit(e) or attempt >= MAX_RETRIES: raise
-                sleep = retry_after(e, min(20*(2**attempt), 180))
-                log.warning(f"Rate-limit, retry in {sleep}s")
-                time.sleep(sleep)
-    raise RuntimeError("All retries exhausted")
+                with open(image_path, "rb") as source:
+                    payload = dict(input_data)
+                    payload[image_field] = source
+                    _last_prediction_started = time.monotonic()
+                    result = replicate.run(model_name, input=payload)
+                return output_to_bytes(result)
+
+            except Exception as exc:
+                if not is_rate_limit_error(exc) or attempt >= MAX_RATE_LIMIT_RETRIES:
+                    raise
+
+                fallback = min(20 * (2 ** attempt), 180)
+                delay = _retry_after_seconds(exc, fallback)
+                log.warning(
+                    "Replicate rate limit for %s; retry %s/%s in %.1f seconds",
+                    model_name, attempt + 1, MAX_RATE_LIMIT_RETRIES, delay
+                )
+                time.sleep(delay)
+
+    raise RuntimeError("Replicate request could not be completed after retries.")
 
 
-# ---------- AI MODELS ----------
-def restore_face(file_path):
-    return run_model(
-        "sczhou/codeformer:cc4956dd26fa5a7185d5660cc9100fab1b8070a1d1654a8bb5eb6d443b020bb2",
-        file_path, {"codeformer_fidelity": CODEFORMER_FIDELITY, "background_enhance": False,
-                     "face_upsample": True, "upscale": 2}
-    )
+def enhance_photo_keep_background(original_bytes):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_dir = Path(temp_dir)
+        source_path = temp_dir / "input_image"
+        source_path.write_bytes(original_bytes)
 
-def upscale(file_path):
-    return run_model("nightmareai/real-esrgan", file_path, {"scale": 4, "face_enhance": False})
+        # Resize before the first AI model; the GPU limit applies to the
+        # input image, not only to the final output.
+        safe_source_path = temp_dir / "input_gpu_safe.jpg"
+        make_gpu_safe_image(source_path, safe_source_path)
 
-def style_transfer(file_path):
-    return run_model(
-        "stability-ai/stable-diffusion-img2img",
-        file_path,
-        {
-            "prompt": STYLE_PROMPT,
-            "negative_prompt": NEG_PROMPT,
-            "num_inference_steps": 25,
-            "guidance_scale": 7.5,
-            "strength": 0.6,
-        }
-    )
-
-INPAINT_MODEL = "stability-ai/stable-diffusion-inpainting:95b7223104132402a9ae91cc44a2809b8e000636d59b12a3ad3761f74ceee6df"
-
-def inpaint_region(image_bytes, mask_rects, prompt):
-    with tempfile.TemporaryDirectory() as d:
-        d = Path(d)
-        img_path = d / "img.png"; img_path.write_bytes(image_bytes)
-        with Image.open(img_path) as im:
-            mask = Image.new("L", im.size, 0)
-            draw = ImageDraw.Draw(mask)
-            for rect in mask_rects: draw.rectangle(rect, fill=255)
-            mask_path = d / "mask.png"; mask.save(mask_path)
-        return run_model(
-            INPAINT_MODEL,
-            img_path,
+        # Model 1: conservative face restoration. A high fidelity value keeps
+        # the result closer to the input instead of aggressively redesigning it.
+        # CodeFormer is a community model, so Replicate requires a pinned
+        # version identifier rather than the unversioned owner/model slug.
+        restored = run_replicate_model(
+            "sczhou/codeformer:cc4956dd26fa5a7185d5660cc9100fab1b8070a1d1654a8bb5eb6d443b020bb2",
+            safe_source_path,
             {
-                "mask": open(mask_path, "rb"),
-                "prompt": prompt + ", realistic skin, high detail",
-                "negative_prompt": NEG_PROMPT,
-                "num_inference_steps": 20,
-                "guidance_scale": 7.5,
-            }
+                "codeformer_fidelity": CODEFORMER_FIDELITY,
+                "background_enhance": False,
+                "face_upsample": True,
+                "upscale": 2,
+            },
+            image_field="image",
         )
+        restored_path = temp_dir / "face_restored.png"
+        restored_path.write_bytes(restored)
+        restored_gpu_safe_path = temp_dir / "face_restored_gpu_safe.jpg"
+        make_gpu_safe_image(restored_path, restored_gpu_safe_path)
 
-def add_markers(img_bytes):
-    # Work on 768x1024 for consistent coordinates
-    with tempfile.TemporaryDirectory() as d:
-        d = Path(d)
-        raw = d / "raw.jpg"; raw.write_bytes(img_bytes)
-        with Image.open(raw) as im:
-            im = im.resize((768, 1024), Image.Resampling.LANCZOS)
-            im.save(d / "resized.jpg", "JPEG", quality=95)
-
-        bindi_mask = [(364,185,404,215)]
-        sindoor_mask = [(375,140,395,190)]
-        nose_mask = [(315,255,335,270)]
-        necklace_mask = [(300,480,470,560)]
-
-        img_bytes = (d / "resized.jpg").read_bytes()
-        img_bytes = inpaint_region(img_bytes, bindi_mask, INPAINT_PROMPTS["bindi"])
-        img_bytes = inpaint_region(img_bytes, sindoor_mask, INPAINT_PROMPTS["sindoor"])
-        img_bytes = inpaint_region(img_bytes, nose_mask, INPAINT_PROMPTS["nose_stud"])
-        img_bytes = inpaint_region(img_bytes, necklace_mask, INPAINT_PROMPTS["necklace"])
-        return img_bytes
-
-def remove_watermark(img_bytes):
-    with tempfile.TemporaryDirectory() as d:
-        d = Path(d)
-        img_path = d / "wm.jpg"; img_path.write_bytes(img_bytes)
-        with Image.open(img_path) as im:
-            w, h = im.size
-            mask = Image.new("L", im.size, 0)
-            draw = ImageDraw.Draw(mask)
-            draw.ellipse([int(w*0.7), int(h*0.45), int(w*0.9), int(h*0.6)], fill=255)
-            mask_path = d / "mask.png"; mask.save(mask_path)
-        return run_model(
-            INPAINT_MODEL,
-            img_path,
-            {
-                "mask": open(mask_path, "rb"),
-                "prompt": "clean skin, no text, no logo, smooth",
-                "negative_prompt": NEG_PROMPT,
-                "num_inference_steps": 20,
-            }
+        # Model 2: general 4x upscaling, with face enhancement disabled so it
+        # does not run a second, more aggressive face-restoration pass.
+        upscaled = run_replicate_model(
+            "nightmareai/real-esrgan",
+            restored_gpu_safe_path,
+            {"scale": 4, "face_enhance": False}
         )
+        upscale_path = temp_dir / "upscaled.png"
+        upscale_path.write_bytes(upscaled)
 
-def remove_bg_fixed(img_bytes):
-    with tempfile.TemporaryDirectory() as d:
-        d = Path(d)
-        inp = d / "bg_inp.jpg"; inp.write_bytes(img_bytes)
-        gpu_safe_path = d / "gpu_safe.jpg"; gpu_safe(inp, gpu_safe_path)
-        transparent = run_model("briaai/rmbg-1.4", gpu_safe_path, {}, image_field="image")
-        return transparent
+        # Keep the original background: do not call Bria or any background-removal model.
+        # Real-ESRGAN output already contains the original scene/background.
+        with Image.open(io.BytesIO(upscaled)) as im:
+            im.load()
+            final_image = ImageOps.exif_transpose(im).convert("RGB")
 
+        # Fit to the requested canvas without cropping or stretching. If aspect
+        # ratios differ, use a softly blurred enlargement of the same photo as
+        # the side/top fill, so the original background remains visually present.
+        foreground = final_image.copy()
+        foreground.thumbnail((OUTPUT_WIDTH, OUTPUT_HEIGHT), Image.Resampling.LANCZOS)
+        background = ImageOps.fit(
+            final_image, (OUTPUT_WIDTH, OUTPUT_HEIGHT),
+            method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
+        ).filter(ImageFilter.GaussianBlur(radius=24))
+        # Darken the blurred fill slightly so the uncropped photo stays clear.
+        background = ImageEnhance.Brightness(background).enhance(0.88)
+        left = (OUTPUT_WIDTH - foreground.width) // 2
+        top = (OUTPUT_HEIGHT - foreground.height) // 2
+        background.paste(foreground, (left, top))
+        final_image = ImageEnhance.Sharpness(background).enhance(1.05)
 
-# ---------- FULL PIPELINE ----------
-def enhance_and_generate(original_bytes):
-    with tempfile.TemporaryDirectory() as d:
-        d = Path(d)
-        raw = d / "raw.jpg"; raw.write_bytes(original_bytes)
-
-        # 1. Face restore
-        restored = restore_face(raw)
-        (d / "restored.png").write_bytes(restored)
-
-        # 2. Upscale
-        upscaled = upscale(d / "restored.png")
-        (d / "upscaled.png").write_bytes(upscaled)
-
-        # 3. Style transfer
-        styled = style_transfer(d / "upscaled.png")
-        (d / "styled.png").write_bytes(styled)
-
-        # 4. KYC markers
-        marked = add_markers((d / "styled.png").read_bytes())
-        (d / "marked.png").write_bytes(marked)
-
-        # 5. Watermark removal
-        clean = remove_watermark((d / "marked.png").read_bytes())
-        (d / "clean.png").write_bytes(clean)
-
-        # 6. Background removal
-        no_bg = remove_bg_fixed((d / "clean.png").read_bytes())
-
-        # Composite on grey canvas
-        with Image.open(io.BytesIO(no_bg)) as sub:
-            sub = ImageOps.exif_transpose(sub).convert("RGBA")
-            alpha = sub.getchannel("A").filter(ImageFilter.GaussianBlur(0.9))
-            sub.putalpha(alpha)
-            sub.thumbnail((OUTPUT_WIDTH, OUTPUT_HEIGHT), Image.Resampling.LANCZOS)
-            canvas = Image.new("RGBA", (OUTPUT_WIDTH, OUTPUT_HEIGHT), GREY_RGB + (255,))
-            left = (OUTPUT_WIDTH - sub.width)//2
-            top = (OUTPUT_HEIGHT - sub.height)//2
-            canvas.alpha_composite(sub, (left, top))
-            final = canvas.convert("RGB")
-            final = ImageEnhance.Sharpness(final).enhance(1.06)
-
-        out = io.BytesIO()
-        final.save(out, format="JPEG", quality=100, subsampling=0, optimize=True)
-        return out.getvalue(), final.size
+        output = io.BytesIO()
+        final_image.save(
+            output, format="JPEG", quality=96,
+            subsampling=0, optimize=True
+        )
+        return output.getvalue(), final_image.size
 
 
-# ---------- TELEGRAM BOT HANDLERS ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["batch"] = []
-    await update.message.reply_text(
-        "👮‍♂️ KYC Portrait Generator\n\n"
-        "Send photos one by one or as an album, then /done.\n"
-        "Output: traditional Indian portrait, 1030×1536 JPG, grey background.\n"
-        "All KYC markers (sindoor, bindi, jewellery) are added automatically.\n\n"
-        "/done — process queue\n"
-        "/cancel — clear queue\n"
-        "/status — check bot health"
+    await update.effective_message.reply_text(
+        "👋 BROTHERS AI PHOTO ENHANCER — ORIGINAL BACKGROUND\n\n"
+        "Send photos one by one or as an album, then send /done.\n"
+        "Output: natural detail enhancement, exact 1030 × 1536 JPG with original background retained.\n"
+        "Large inputs are automatically resized for GPU safety without cropping.\n"
+        "Processing is sequential with automatic waiting/retry for API rate limits.\n\n"
+        "/done — process queued photos\n"
+        "/cancel — clear the queue\n"
+        "/status — check bot status"
     )
 
+
 async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
+    msg = update.effective_message
     media = msg.photo[-1] if msg.photo else msg.document
+
     if not media:
         return
     if msg.document and msg.document.mime_type and not msg.document.mime_type.startswith("image/"):
-        await msg.reply_text("Only images allowed.")
+        await msg.reply_text("Please send an image file (JPG, PNG, or WEBP).")
         return
     if media.file_size and media.file_size > MAX_UPLOAD_MB * 1024 * 1024:
-        await msg.reply_text(f"Too large – max {MAX_UPLOAD_MB} MB.")
+        await msg.reply_text(f"Image is too large. Maximum upload: {MAX_UPLOAD_MB} MB.")
         return
 
     batch = context.user_data.setdefault("batch", [])
     if len(batch) >= MAX_BATCH_PHOTOS:
-        await msg.reply_text(f"Queue full ({MAX_BATCH_PHOTOS}). Send /done.")
+        await msg.reply_text(
+            f"Batch limit reached ({MAX_BATCH_PHOTOS}). Send /done to process it."
+        )
         return
 
     batch.append(media.file_id)
-    await msg.reply_text(f"📥 Added ({len(batch)}/{MAX_BATCH_PHOTOS}). Send more or /done.")
+    await msg.reply_text(
+        f"📥 Added to batch: {len(batch)}/{MAX_BATCH_PHOTOS}.\n"
+        "Send more photos or type /done."
+    )
+
 
 async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
+    msg = update.effective_message
     batch = context.user_data.get("batch", [])
+
     if not batch:
-        await msg.reply_text("No photos queued.")
+        await msg.reply_text("No photos queued. Send photos first.")
         return
     if not REPLICATE_API_TOKEN:
-        await msg.reply_text("❌ REPLICATE_API_TOKEN missing in environment.")
+        await msg.reply_text(
+            "❌ Server setup error: REPLICATE_API_TOKEN is missing in Render Environment."
+        )
         return
 
+    processing_users = context.application.bot_data.setdefault("processing_users", set())
+    user_id = update.effective_user.id
+    if user_id in processing_users:
+        await msg.reply_text("⏳ Your previous batch is still processing. Please wait for it to finish.")
+        return
+    processing_users.add(user_id)
     context.user_data["batch"] = []
-    status_msg = await msg.reply_text(f"⏳ Processing {len(batch)} photo(s)...")
-    success, failed = 0, 0
+    status_msg = await msg.reply_text(
+        f"⏳ Starting {len(batch)} photo(s).\n"
+        "The bot will wait automatically if Replicate rate-limits a request."
+    )
+    success = 0
+    failed = 0
 
-    for idx, file_id in enumerate(batch, 1):
+    for index, file_id in enumerate(batch, start=1):
         try:
-            await status_msg.edit_text(f"⏳ Processing {idx}/{len(batch)} – ✅ {success} ❌ {failed}")
+            await status_msg.edit_text(
+                f"⏳ Processing photo {index}/{len(batch)}\n"
+                f"✅ Completed: {success} | ❌ Failed: {failed}\n"
+                "API requests are spaced out; throttled requests retry automatically."
+            )
+
             tg_file = await context.bot.get_file(file_id)
             raw = bytes(await tg_file.download_as_bytearray())
-            result_bytes, dims = await asyncio.to_thread(enhance_and_generate, raw)
+
+            result_bytes, dimensions = await asyncio.to_thread(
+                enhance_photo_keep_background, raw
+            )
+
             await msg.reply_document(
                 document=io.BytesIO(result_bytes),
-                filename=f"kyc_portrait_{idx}.jpg",
-                caption=f"✅ Done {idx}/{len(batch)}\nSize: {dims[0]}×{dims[1]}"
+                filename=f"brothers_1030x1536_{index}.jpg",
+                caption=(
+                    f"✅ Enhanced photo {index}/{len(batch)}\n"
+                    f"Output: {dimensions[0]} × {dimensions[1]} px\n"
+                    "Background: Original background retained (no background-removal model).\n"
+                    f"Face restoration fidelity: {CODEFORMER_FIDELITY:.2f}\n"
+                    "Visible frame retained; no crop, stretch or invented body/clothing."
+                )
             )
             success += 1
-        except Exception as ex:
-            failed += 1
-            log.exception(f"Photo {idx} failed")
-            await msg.reply_text(f"❌ Photo {idx} error: {str(ex)[:400]}\nCheck logs.")
 
-    await status_msg.edit_text(f"🏁 Batch complete – ✅ {success} / ❌ {failed}")
+        except Exception as exc:
+            failed += 1
+            log.exception("Photo %s processing failed", index)
+            error_text = str(exc)
+            if REPLICATE_API_TOKEN:
+                error_text = error_text.replace(REPLICATE_API_TOKEN, "[hidden token]")
+            await msg.reply_text(
+                f"❌ Photo {index} failed.\n"
+                f"Error: {error_text[:450]}\n"
+                "If this is an API rate/credit limit, the bot has retried automatically. "
+                "Check Replicate Billing/Usage and Render Logs."
+            )
+
+    processing_users.discard(user_id)
+    await status_msg.edit_text(
+        f"🏁 Batch finished!\n"
+        f"✅ Successful: {success}\n"
+        f"❌ Failed: {failed}\n\n"
+        "Send another batch whenever you are ready."
+    )
+
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = len(context.user_data.get("batch", []))
     context.user_data["batch"] = []
-    await update.message.reply_text(f"🗑 Cleared {count} photo(s).")
+    await update.effective_message.reply_text(f"🗑️ Cleared {count} queued photo(s).")
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🟢 Bot is running.")
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    processing_users = context.application.bot_data.setdefault("processing_users", set())
+    active = update.effective_user.id in processing_users
+    queued = len(context.user_data.get("batch", []))
+    await update.effective_message.reply_text(
+        f"🟢 Bot is running.\nQueued photos: {queued}\nProcessing: {'Yes' if active else 'No'}"
+    )
+
 
 async def error_handler(update, context):
-    log.exception("Telegram error", exc_info=context.error)
+    log.exception("Unhandled Telegram handler error", exc_info=context.error)
 
 
-# ---------- MAIN ENTRY POINT ----------
-async def main():
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is missing from Render Environment.")
+    if not REPLICATE_API_TOKEN:
+        raise RuntimeError("REPLICATE_API_TOKEN is missing from Render Environment.")
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("done", done))
     app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("status", status))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, receive_photo))
     app.add_error_handler(error_handler)
+    app.run_polling(drop_pending_updates=True, close_loop=False)
 
-    # Ensure no leftover webhook
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    await app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    if not BOT_TOKEN or not REPLICATE_API_TOKEN:
-        raise RuntimeError("Set BOT_TOKEN and REPLICATE_API_TOKEN environment variables.")
-    asyncio.run(main())
+    main()
