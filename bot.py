@@ -355,7 +355,7 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, receive_photo))
     app.add_error_handler(error_handler)
-    app.run_polling(drop_pending_updates=True, close_loop=False)
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
