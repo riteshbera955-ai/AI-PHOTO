@@ -135,7 +135,10 @@ def run_replicate_model(model_name, image_path, input_data, image_field="image")
     raise RuntimeError("Replicate request could not be completed after retries.")
 
 
-def enhance_and_remove_background(original_bytes):
+def enhance_and_remove_background(original_bytes, progress_callback=None):
+    def report(stage):
+        if progress_callback:
+            progress_callback(stage)
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_dir = Path(temp_dir)
         source_path = temp_dir / "input_image"
@@ -150,6 +153,7 @@ def enhance_and_remove_background(original_bytes):
         # the result closer to the input instead of aggressively redesigning it.
         # CodeFormer is a community model, so Replicate requires a pinned
         # version identifier rather than the unversioned owner/model slug.
+        report("Restoring face details (model 1/3)…")
         restored = run_replicate_model(
             "sczhou/codeformer:cc4956dd26fa5a7185d5660cc9100fab1b8070a1d1654a8bb5eb6d443b020bb2",
             safe_source_path,
@@ -168,6 +172,7 @@ def enhance_and_remove_background(original_bytes):
 
         # Model 2: general 4x upscaling, with face enhancement disabled so it
         # does not run a second, more aggressive face-restoration pass.
+        report("Upscaling image (model 2/3)…")
         upscaled = run_replicate_model(
             "nightmareai/real-esrgan",
             restored_gpu_safe_path,
@@ -182,12 +187,14 @@ def enhance_and_remove_background(original_bytes):
         make_gpu_safe_image(upscale_path, bria_input_path)
 
         # Model 3: remove background and preserve alpha for a clean grey composite.
+        report("Removing background (model 3/3)…")
         transparent = run_replicate_model(
             "bria/remove-background",
             bria_input_path,
             {"preserve_alpha": True, "content_moderation": False}
         )
 
+        report("Finishing image and preparing Telegram upload…")
         with Image.open(io.BytesIO(transparent)) as im:
             im.load()
             subject = ImageOps.exif_transpose(im).convert("RGBA")
@@ -260,6 +267,7 @@ async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
+    user_id = update.effective_user.id
     batch = context.user_data.get("batch", [])
 
     if not batch:
@@ -271,61 +279,93 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Prevent the same user from starting overlapping batches in this process.
+    processing_users = context.application.bot_data.setdefault("processing_users", set())
+    if user_id in processing_users:
+        await msg.reply_text("⏳ Your previous batch is still processing. Please wait.")
+        return
+
+    processing_users.add(user_id)
     context.user_data["batch"] = []
+    context.user_data["processing"] = True
+    context.user_data["progress"] = "Starting batch…"
     status_msg = await msg.reply_text(
         f"⏳ Starting {len(batch)} photo(s).\n"
-        "The bot will wait automatically if Replicate rate-limits a request."
+        "Each photo runs three AI stages sequentially. This can take several minutes."
     )
     success = 0
     failed = 0
+    loop = asyncio.get_running_loop()
 
-    for index, file_id in enumerate(batch, start=1):
-        try:
-            await status_msg.edit_text(
-                f"⏳ Processing photo {index}/{len(batch)}\n"
-                f"✅ Completed: {success} | ❌ Failed: {failed}\n"
-                "API requests are spaced out; throttled requests retry automatically."
-            )
-
-            tg_file = await context.bot.get_file(file_id)
-            raw = bytes(await tg_file.download_as_bytearray())
-
-            result_bytes, dimensions = await asyncio.to_thread(
-                enhance_and_remove_background, raw
-            )
-
-            await msg.reply_document(
-                document=io.BytesIO(result_bytes),
-                filename=f"brothers_1030x1536_{index}.jpg",
-                caption=(
-                    f"✅ Enhanced photo {index}/{len(batch)}\n"
-                    f"Output: {dimensions[0]} × {dimensions[1]} px\n"
-                    "Background: Smooth matte grey (#808080)\n"
-                    f"Face restoration fidelity: {CODEFORMER_FIDELITY:.2f}\n"
-                    "Visible frame retained; no crop, stretch or invented body/clothing."
+    try:
+        for index, file_id in enumerate(batch, start=1):
+            try:
+                context.user_data["progress"] = f"Downloading photo {index}/{len(batch)}…"
+                await status_msg.edit_text(
+                    f"⏳ Processing photo {index}/{len(batch)}\n"
+                    f"✅ Completed: {success} | ❌ Failed: {failed}\n"
+                    f"Current step: {context.user_data['progress']}"
                 )
-            )
-            success += 1
 
-        except Exception as exc:
-            failed += 1
-            log.exception("Photo %s processing failed", index)
-            error_text = str(exc)
-            if REPLICATE_API_TOKEN:
-                error_text = error_text.replace(REPLICATE_API_TOKEN, "[hidden token]")
-            await msg.reply_text(
-                f"❌ Photo {index} failed.\n"
-                f"Error: {error_text[:450]}\n"
-                "If this is an API rate/credit limit, the bot has retried automatically. "
-                "Check Replicate Billing/Usage and Render Logs."
-            )
+                tg_file = await context.bot.get_file(file_id)
+                raw = bytes(await tg_file.download_as_bytearray())
 
-    await status_msg.edit_text(
-        f"🏁 Batch finished!\n"
-        f"✅ Successful: {success}\n"
-        f"❌ Failed: {failed}\n\n"
-        "Send another batch whenever you are ready."
-    )
+                async def update_progress(stage, photo_index=index):
+                    context.user_data["progress"] = f"Photo {photo_index}/{len(batch)}: {stage}"
+                    await status_msg.edit_text(
+                        f"⏳ Processing photo {photo_index}/{len(batch)}\n"
+                        f"✅ Completed: {success} | ❌ Failed: {failed}\n"
+                        f"Current step: {stage}"
+                    )
+
+                def report_from_worker(stage, photo_index=index):
+                    future = asyncio.run_coroutine_threadsafe(
+                        update_progress(stage, photo_index), loop
+                    )
+                    try:
+                        future.result(timeout=20)
+                    except Exception:
+                        log.warning("Could not update Telegram progress message", exc_info=True)
+
+                result_bytes, dimensions = await asyncio.to_thread(
+                    enhance_and_remove_background, raw, report_from_worker
+                )
+
+                await msg.reply_document(
+                    document=io.BytesIO(result_bytes),
+                    filename=f"brothers_1030x1536_{index}.jpg",
+                    caption=(
+                        f"✅ Enhanced photo {index}/{len(batch)}\n"
+                        f"Output: {dimensions[0]} × {dimensions[1]} px\n"
+                        "Background: Smooth matte grey (#808080)\n"
+                        f"Face restoration fidelity: {CODEFORMER_FIDELITY:.2f}\n"
+                        "Visible frame retained; no crop, stretch or invented body/clothing."
+                    )
+                )
+                success += 1
+
+            except Exception as exc:
+                failed += 1
+                log.exception("Photo %s processing failed", index)
+                error_text = str(exc)
+                if REPLICATE_API_TOKEN:
+                    error_text = error_text.replace(REPLICATE_API_TOKEN, "[hidden token]")
+                await msg.reply_text(
+                    f"❌ Photo {index} failed.\n"
+                    f"Error: {error_text[:450]}\n"
+                    "Check Replicate Billing/Usage and Render Logs."
+                )
+
+        await status_msg.edit_text(
+            f"🏁 Batch finished!\n"
+            f"✅ Successful: {success}\n"
+            f"❌ Failed: {failed}\n\n"
+            "Send another batch whenever you are ready."
+        )
+    finally:
+        context.user_data["processing"] = False
+        context.user_data["progress"] = "Idle"
+        processing_users.discard(user_id)
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -335,7 +375,14 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("🟢 Bot is running.")
+    if context.user_data.get("processing"):
+        current = context.user_data.get("progress", "Processing…")
+        await update.effective_message.reply_text(f"🟢 Bot is running.\\n⏳ {current}")
+    else:
+        queued = len(context.user_data.get("batch", []))
+        await update.effective_message.reply_text(
+            f"🟢 Bot is running.\\n📥 Queued photos: {queued}\\nStatus: Idle"
+        )
 
 
 async def error_handler(update, context):
@@ -348,7 +395,7 @@ def main():
     if not REPLICATE_API_TOKEN:
         raise RuntimeError("REPLICATE_API_TOKEN is missing from Render Environment.")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Run exactly one Render instance/worker for this polling bot token.\n    app = Application.builder().token(BOT_TOKEN).concurrent_updates(False).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("done", done))
     app.add_handler(CommandHandler("cancel", cancel))
