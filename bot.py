@@ -24,8 +24,8 @@ OUTPUT_WIDTH = int(os.getenv("OUTPUT_WIDTH", "1030"))
 OUTPUT_HEIGHT = int(os.getenv("OUTPUT_HEIGHT", "1536"))
 
 # Pinned, documented Replicate model versions.
-SWINIR_MODEL = "jingyunliang/swinir:660d922d33153019e8c263a3bba265de882e7f4f70396546b6c9c8f9d47a021a"
-GFPGAN_MODEL = "tencentarc/gfpgan:0fbacf7afc6c144e5be9767cff80f25aff23e52b0708f17e20f9879b2f21516c"
+NAFNET_MODEL = "megvii-research/nafnet:e116b6df8437d9c562f9de2a86cea6fd76a96705e502f091457926bbe989436c"
+REALESRGAN_MODEL = "nightmareai/real-esrgan"
 
 # Replicate account previously reported a low prediction-creation limit.
 MIN_SECONDS_BETWEEN_PREDICTIONS = 15
@@ -144,6 +144,7 @@ def fit_exact_canvas(image, width, height):
 
 
 def enhance_photo(original_bytes):
+    """Deblur the complete original frame, then upscale without face replacement."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         source_path = tmp / "input.jpg"
@@ -151,36 +152,33 @@ def enhance_photo(original_bytes):
         safe_path = tmp / "input_safe.jpg"
         make_safe_image(source_path, safe_path)
 
-        # Stage 1: full-frame restoration/upscaling. Original background remains in-frame.
-        swinir_bytes = run_model(
-            SWINIR_MODEL,
+        # Stage 1: NAFNet deblurring. The model returns the complete image frame.
+        nafnet_bytes = run_model(
+            NAFNET_MODEL,
             safe_path,
-            {
-                "task_type":"Real-World Image Super-Resolution-Medium",
-                "noise": 15,
-                "jpeg": 40,
-            },
+            {"task_type": "Image Debluring (GoPro)"},
             image_field="image",
         )
-        swinir_path = tmp / "swinir.png"
-        swinir_path.write_bytes(swinir_bytes)
-        swinir_safe = tmp / "swinir_safe.jpg"
-        make_safe_image(swinir_path, swinir_safe)
+        nafnet_path = tmp / "nafnet.png"
+        nafnet_path.write_bytes(nafnet_bytes)
+        nafnet_safe = tmp / "nafnet_safe.jpg"
+        make_safe_image(nafnet_path, nafnet_safe)
 
-        # Stage 2: face-only restoration pass; GFPGAN keeps the full scene in its output.
-        gfpgan_bytes = run_model(
-            GFPGAN_MODEL,
-            swinir_safe,
-            {"version": "v1.4", "scale": 2},
-            image_field="img",
+        # Stage 2: Real-ESRGAN upscale; face_enhance=False avoids a separate
+        # face-generation pass and keeps the original background in the frame.
+        upscale_bytes = run_model(
+            REALESRGAN_MODEL,
+            nafnet_safe,
+            {"scale": 2, "face_enhance": False},
+            image_field="image",
         )
 
-        with Image.open(io.BytesIO(gfpgan_bytes)) as im:
+        with Image.open(io.BytesIO(upscale_bytes)) as im:
             im.load()
             final_image = fit_exact_canvas(im, OUTPUT_WIDTH, OUTPUT_HEIGHT)
 
-        # Very mild sharpening only; do not add synthetic detail aggressively.
-        final_image = ImageEnhance.Sharpness(final_image).enhance(1.02)
+        # Very mild sharpening only; no invented background or facial details.
+        final_image = ImageEnhance.Sharpness(final_image).enhance(1.01)
         out = io.BytesIO()
         final_image.save(out, format="JPEG", quality=96, subsampling=0, optimize=True)
         return out.getvalue(), final_image.size
@@ -191,7 +189,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "👋 BROTHERS AI PHOTO RESTORER\n\n"
         "Send photos, then /done to process.\n"
-        "Models: SwinIR (full-frame restoration) + GFPGAN (face restoration).\n"
+        "Models: NAFNet (full-frame deblurring) + Real-ESRGAN (upscaling).\n"
         "Original scene/background is retained; no background removal.\n"
         f"Output: {OUTPUT_WIDTH} × {OUTPUT_HEIGHT} JPG.\n\n"
         "/done — process queued photos\n/cancel — clear queue\n/status — check status"
@@ -234,7 +232,7 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     processing_users.add(user_id)
     context.user_data["batch"] = []
-    status_msg = await msg.reply_text(f"⏳ Starting {len(batch)} photo(s) with SwinIR + GFPGAN...")
+    status_msg = await msg.reply_text(f"⏳ Starting {len(batch)} photo(s) with NAFNet + Real-ESRGAN...")
     success = 0
     failed = 0
     try:
@@ -243,7 +241,7 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status_msg.edit_text(
                     f"⏳ Processing photo {index}/{len(batch)}\n"
                     f"✅ Completed: {success} | ❌ Failed: {failed}\n"
-                    "Stage 1/2: full-image restoration; Stage 2/2: face restoration."
+                    "Stage 1/2: full-frame deblurring; Stage 2/2: image upscaling."
                 )
                 tg_file = await context.bot.get_file(file_id)
                 raw = bytes(await tg_file.download_as_bytearray())
@@ -254,7 +252,7 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=(
                         f"✅ Restored photo {index}/{len(batch)}\n"
                         f"Output: {dimensions[0]} × {dimensions[1]} px\n"
-                        "Models: SwinIR + GFPGAN v1.4\n"
+                        "Models: NAFNet + Real-ESRGAN (face enhancement off)\n"
                         "Original background retained; no background removal."
                     ),
                 )
