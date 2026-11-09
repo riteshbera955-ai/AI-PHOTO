@@ -19,8 +19,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "").strip()
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "15"))
 MAX_BATCH_PHOTOS = int(os.getenv("MAX_BATCH_PHOTOS", "20"))
-OUTPUT_LONG_EDGE = int(os.getenv("OUTPUT_LONG_EDGE", "3840"))
-CODEFORMER_FIDELITY = float(os.getenv("CODEFORMER_FIDELITY", "0.80"))
+OUTPUT_WIDTH = int(os.getenv("OUTPUT_WIDTH", "1030"))
+OUTPUT_HEIGHT = int(os.getenv("OUTPUT_HEIGHT", "1536"))
+CODEFORMER_FIDELITY = float(os.getenv("CODEFORMER_FIDELITY", "0.95"))
 GREY_RGB = (128, 128, 128)  # smooth, uniform matte grey (#808080)
 
 # Replicate account limit in the user's logs: 6 prediction creations/minute.
@@ -196,27 +197,25 @@ def enhance_and_remove_background(original_bytes):
         alpha = subject.getchannel("A").filter(ImageFilter.GaussianBlur(radius=0.9))
         subject.putalpha(alpha)
 
-        width, height = subject.size
-        factor = OUTPUT_LONG_EDGE / max(width, height)
-        new_size = (
-            max(1, round(width * factor)),
-            max(1, round(height * factor))
+        # Fit the complete restored image inside the exact requested portrait
+        # canvas. This preserves the whole frame and its proportions (no crop
+        # or stretch); any unused area is filled with the same matte grey.
+        target_size = (OUTPUT_WIDTH, OUTPUT_HEIGHT)
+        fitted = ImageOps.contain(
+            subject, target_size, method=Image.Resampling.LANCZOS
         )
-        if new_size != subject.size:
-            subject = subject.resize(new_size, Image.Resampling.LANCZOS)
-
-        # Always composite onto one perfectly uniform matte-grey canvas.
-        # This avoids gradients, texture, shadows, or leftover source-background patches.
-        canvas = Image.new("RGBA", new_size, GREY_RGB + (255,))
-        canvas.alpha_composite(subject)
+        canvas = Image.new("RGBA", target_size, GREY_RGB + (255,))
+        x = (OUTPUT_WIDTH - fitted.width) // 2
+        y = (OUTPUT_HEIGHT - fitted.height) // 2
+        canvas.alpha_composite(fitted, (x, y))
         final_image = canvas.convert("RGB")
-        # Mild contrast and sharpening retain texture without over-smoothing skin.
-        final_image = ImageEnhance.Contrast(final_image).enhance(1.03)
-        final_image = ImageEnhance.Sharpness(final_image).enhance(1.15)
+        # Subtle finishing only: avoid plastic skin and exaggerated edges.
+        final_image = ImageEnhance.Contrast(final_image).enhance(1.02)
+        final_image = ImageEnhance.Sharpness(final_image).enhance(1.08)
 
         output = io.BytesIO()
         final_image.save(
-            output, format="JPEG", quality=96,
+            output, format="JPEG", quality=100,
             subsampling=0, optimize=True
         )
         return output.getvalue(), final_image.size
@@ -227,7 +226,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "👋 BROTHERS AI PHOTO ENHANCER\n\n"
         "Send photos one by one or as an album, then send /done.\n"
-        "Output: conservative face restoration, 4x upscaling and smooth grey background.\n"
+        "Output: detailed face restoration, 4x upscaling and smooth grey background.\n"
+        "Final JPG: exactly 1030 × 1536 pixels, high quality.\n"
         "Large inputs are automatically resized for GPU safety without cropping.\n"
         "Processing is sequential with automatic waiting/retry for API rate limits.\n\n"
         "/done — process queued photos\n"
@@ -301,13 +301,13 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await msg.reply_document(
                 document=io.BytesIO(result_bytes),
-                filename=f"brothers_4k_grey_{index}.jpg",
+                filename=f"brothers_1030x1536_crystal_{index}.jpg",
                 caption=(
                     f"✅ Enhanced photo {index}/{len(batch)}\n"
                     f"Output: {dimensions[0]} × {dimensions[1]} px\n"
                     "Background: Smooth matte grey (#808080)\n"
                     f"Face restoration fidelity: {CODEFORMER_FIDELITY:.2f}\n"
-                    "Full frame retained; no intentional crop or stretch."
+                    "Full frame fitted; no crop or stretch. JPG quality: 100."
                 )
             )
             success += 1
