@@ -1,13 +1,11 @@
 import os
 import io
+import time
+import base64
 import asyncio
 import logging
-import tempfile
-import time
 import threading
-from pathlib import Path
 
-import replicate
 import requests
 from PIL import Image, ImageOps
 from telegram import Update
@@ -17,156 +15,120 @@ from telegram.ext import (
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "").strip()
+FAL_KEY = os.getenv("FAL_KEY", "").strip()
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "15"))
-MAX_BATCH_PHOTOS = int(os.getenv("MAX_BATCH_PHOTOS", "20"))
-OUTPUT_WIDTH = int(os.getenv("OUTPUT_WIDTH", "1030"))
-OUTPUT_HEIGHT = int(os.getenv("OUTPUT_HEIGHT", "1536"))
+MAX_BATCH_PHOTOS = int(os.getenv("MAX_BATCH_PHOTOS", "30"))
 
-# Pinned, documented Replicate model versions.
-SWIN2SR_MODEL = "mv-lab/swin2sr:a01b0512004918ca55d02e554914a9eca63909fa83a29ff0f115c78a7045574f"
-
-# Replicate account previously reported a low prediction-creation limit.
-MIN_SECONDS_BETWEEN_PREDICTIONS = 15
-MAX_RATE_LIMIT_RETRIES = 5
-GPU_MAX_PIXELS = int(os.getenv("GPU_MAX_PIXELS", "1800000"))
-_request_lock = threading.Lock()
-_last_prediction_started = 0.0
+# Fal.ai photo restoration endpoint. No Replicate, Gemini, NAFNet or Swin2SR.
+FAL_MODEL = "fal-ai/image-editing/photo-restoration"
+FAL_QUEUE_BASE = "https://queue.fal.run"
+FAL_TIMEOUT_SECONDS = int(os.getenv("FAL_TIMEOUT_SECONDS", "900"))
+FAL_POLL_INTERVAL = float(os.getenv("FAL_POLL_INTERVAL", "2.5"))
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 log = logging.getLogger("brothers-photo-bot")
-
-if REPLICATE_API_TOKEN:
-    os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
+_fal_lock = threading.Lock()
 
 
-def make_safe_image(input_path, output_path):
-    """Normalize orientation and keep the complete image within GPU pixel limits."""
-    with Image.open(input_path) as im:
-        im = ImageOps.exif_transpose(im).convert("RGB")
-        w, h = im.size
-        if w * h > GPU_MAX_PIXELS:
-            factor = (GPU_MAX_PIXELS / float(w * h)) ** 0.5
-            im = im.resize(
-                (max(1, int(w * factor)), max(1, int(h * factor))),
-                Image.Resampling.LANCZOS
-            )
-        im.save(output_path, "JPEG", quality=95, optimize=True)
-    return output_path
+def _fal_headers():
+    if not FAL_KEY:
+        raise RuntimeError("FAL_KEY is missing in Render Environment.")
+    return {"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"}
 
 
-def output_to_bytes(output):
-    if isinstance(output, (bytes, bytearray)):
-        return bytes(output)
-    if hasattr(output, "read"):
-        data = output.read()
-        if data:
-            return data
-    if isinstance(output, (list, tuple)) and output:
-        return output_to_bytes(output[0])
-    if isinstance(output, dict):
-        # Some Replicate wrappers return a file URL in a dictionary.
-        for key in ("url", "file", "output"):
-            if output.get(key):
-                return output_to_bytes(output[key])
-    if isinstance(output, str) and output.startswith("http"):
-        response = requests.get(output, timeout=180)
-        response.raise_for_status()
-        return response.content
-    # Newer Replicate FileOutput objects can expose a URL property.
-    url = getattr(output, "url", None)
-    if callable(url):
-        url = url()
-    if isinstance(url, str) and url.startswith("http"):
-        response = requests.get(url, timeout=180)
-        response.raise_for_status()
-        return response.content
-    raise RuntimeError(f"Unexpected Replicate output type: {type(output).__name__}")
-
-
-def is_rate_limit_error(exc):
-    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
-    message = str(exc).lower()
-    return status == 429 or "429" in message or "throttl" in message or "rate limit" in message
-
-
-def retry_after_seconds(exc, fallback):
-    response = getattr(exc, "response", None)
-    headers = getattr(response, "headers", None) or {}
-    value = headers.get("Retry-After") or headers.get("retry-after")
+def _response_json(response):
     try:
-        return max(float(value), 1.0) if value is not None else fallback
-    except (TypeError, ValueError):
-        return fallback
+        data = response.json()
+    except Exception:
+        data = {"detail": response.text[:1000]}
+    if not response.ok:
+        message = data.get("detail") or data.get("message") or data
+        raise RuntimeError(f"fal.ai HTTP {response.status_code}: {message}")
+    return data
 
 
-def run_model(model_name, image_path, input_data, image_field="image"):
-    """Run one Replicate prediction at a time, retrying rate limits."""
-    global _last_prediction_started
-    with _request_lock:
-        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
-            gap = MIN_SECONDS_BETWEEN_PREDICTIONS - (time.monotonic() - _last_prediction_started)
-            if gap > 0:
-                log.info("Replicate request spacing: waiting %.1f seconds", gap)
-                time.sleep(gap)
-            try:
-                with open(image_path, "rb") as source:
-                    payload = dict(input_data)
-                    payload[image_field] = source
-                    _last_prediction_started = time.monotonic()
-                    result = replicate.run(model_name, input=payload)
-                return output_to_bytes(result)
-            except Exception as exc:
-                if not is_rate_limit_error(exc) or attempt >= MAX_RATE_LIMIT_RETRIES:
-                    raise
-                delay = retry_after_seconds(exc, min(20 * (2 ** attempt), 180))
-                log.warning("Rate limit on %s; retry %s/%s in %.1fs", model_name, attempt + 1, MAX_RATE_LIMIT_RETRIES, delay)
-                time.sleep(delay)
-    raise RuntimeError("Replicate request failed after retries")
+def fal_restore(image_bytes):
+    """Submit a photo to fal.ai and wait for the restored image URL."""
+    # fal accepts a base64 data URI, so no public image hosting is needed.
+    mime = "image/jpeg"
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            mime = "image/png" if im.format == "PNG" else "image/jpeg"
+    except Exception:
+        pass
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    data_uri = f"data:{mime};base64,{encoded}"
+
+    payload = {
+        "image_url": data_uri,
+        "guidance_scale": 3.5,
+        "num_inference_steps": 30,
+        "output_format": "jpeg"
+    }
+
+    with _fal_lock:
+        submit_url = f"{FAL_QUEUE_BASE}/{FAL_MODEL}"
+        submit = requests.post(
+            submit_url, headers=_fal_headers(), json=payload, timeout=120
+        )
+        submitted = _response_json(submit)
+        request_id = submitted.get("request_id")
+        if not request_id:
+            raise RuntimeError(f"fal.ai did not return request_id: {submitted}")
+
+        status_url = f"{FAL_QUEUE_BASE}/{FAL_MODEL}/requests/{request_id}/status"
+        result_url = f"{FAL_QUEUE_BASE}/{FAL_MODEL}/requests/{request_id}"
+        deadline = time.monotonic() + FAL_TIMEOUT_SECONDS
+
+        while time.monotonic() < deadline:
+            status_response = requests.get(
+                status_url, headers={"Authorization": f"Key {FAL_KEY}"}, timeout=60
+            )
+            status_data = _response_json(status_response)
+            state = status_data.get("status", "").upper()
+
+            if state == "COMPLETED":
+                result_response = requests.get(
+                    result_url, headers={"Authorization": f"Key {FAL_KEY}"}, timeout=120
+                )
+                result_data = _response_json(result_response)
+                images = result_data.get("images") or []
+                if not images or not images[0].get("url"):
+                    raise RuntimeError(f"fal.ai completed but returned no image: {result_data}")
+                image_response = requests.get(images[0]["url"], timeout=180)
+                image_response.raise_for_status()
+                return image_response.content
+
+            if state in {"FAILED", "CANCELLED"}:
+                raise RuntimeError(f"fal.ai job {state}: {status_data}")
+
+            time.sleep(FAL_POLL_INTERVAL)
+
+    raise TimeoutError(f"fal.ai job timed out after {FAL_TIMEOUT_SECONDS} seconds")
 
 
-def fit_exact_canvas(image, width, height):
-    """Fit without cropping or stretching; use an edge-colour canvas for any small margins."""
-    image = ImageOps.exif_transpose(image).convert("RGB")
-    image.thumbnail((width, height), Image.Resampling.LANCZOS)
-    # Edge-colour padding avoids cropping the original scene or distorting people.
-    px = image.load()
-    w, h = image.size
-    samples = [px[0, 0], px[w - 1, 0], px[0, h - 1], px[w - 1, h - 1]]
-    background = tuple(sum(c[i] for c in samples) // len(samples) for i in range(3))
-    canvas = Image.new("RGB", (width, height), background)
-    canvas.paste(image, ((width - w) // 2, (height - h) // 2))
-    return canvas
+def normalize_output(restored_bytes, original_bytes):
+    """Keep the original photo's exact pixel dimensions and avoid border bars."""
+    with Image.open(io.BytesIO(original_bytes)) as original:
+        original = ImageOps.exif_transpose(original)
+        target_size = original.size
+
+    with Image.open(io.BytesIO(restored_bytes)) as restored:
+        restored = ImageOps.exif_transpose(restored).convert("RGB")
+        # Resize directly to the original canvas. This avoids adding gray/black bars.
+        if restored.size != target_size:
+            restored = restored.resize(target_size, Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        restored.save(output, "JPEG", quality=95, subsampling=0, optimize=True)
+        return output.getvalue(), target_size
 
 
 def enhance_photo(original_bytes):
-    """Restore JPEG compression artifacts and upscale with one full-frame model."""
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        source_path = tmp / "input.jpg"
-        source_path.write_bytes(original_bytes)
-        safe_path = tmp / "input_safe.jpg"
-        make_safe_image(source_path, safe_path)
-
-        # Swin2SR's documented task name for JPEG/compression restoration.
-        # It processes the complete frame; no face swap or background removal.
-        restored_bytes = run_model(
-            SWIN2SR_MODEL,
-            safe_path,
-            {"task": "compressed_sr"},
-            image_field="image",
-        )
-
-        with Image.open(io.BytesIO(restored_bytes)) as im:
-            im.load()
-            final_image = fit_exact_canvas(im, OUTPUT_WIDTH, OUTPUT_HEIGHT)
-
-        out = io.BytesIO()
-        final_image.save(out, format="JPEG", quality=96, subsampling=0, optimize=True)
-        return out.getvalue(), final_image.size
+    restored = fal_restore(original_bytes)
+    return normalize_output(restored, original_bytes)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -174,10 +136,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "👋 BROTHERS AI PHOTO RESTORER\n\n"
         "Send photos, then /done to process.\n"
-        "Model: Swin2SR (JPEG compression restoration + super-resolution).\n"
+        "Model: fal.ai Photo Restoration.\n"
         "Original scene/background is retained; no background removal.\n"
-        f"Output: {OUTPUT_WIDTH} × {OUTPUT_HEIGHT} JPG.\n\n"
-        "/done — process queued photos\n/cancel — clear queue\n/status — check status"
+        "Output keeps each source photo's pixel dimensions.\n\n"
+        "/done — process queued photos\n"
+        "/cancel — clear queue\n"
+        "/status — check status"
     )
 
 
@@ -206,8 +170,8 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not batch:
         await msg.reply_text("No photos queued. Send photos first.")
         return
-    if not REPLICATE_API_TOKEN:
-        await msg.reply_text("❌ REPLICATE_API_TOKEN is missing in Render Environment.")
+    if not FAL_KEY:
+        await msg.reply_text("❌ FAL_KEY is missing in Render Environment.")
         return
 
     processing_users = context.application.bot_data.setdefault("processing_users", set())
@@ -215,9 +179,10 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in processing_users:
         await msg.reply_text("⏳ Your previous batch is still processing. Please wait.")
         return
+
     processing_users.add(user_id)
     context.user_data["batch"] = []
-    status_msg = await msg.reply_text(f"⏳ Starting {len(batch)} photo(s) with Swin2SR...")
+    status_msg = await msg.reply_text(f"⏳ Starting {len(batch)} photo(s) with fal.ai...")
     success = 0
     failed = 0
     try:
@@ -226,7 +191,7 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status_msg.edit_text(
                     f"⏳ Processing photo {index}/{len(batch)}\n"
                     f"✅ Completed: {success} | ❌ Failed: {failed}\n"
-                    "Stage 1/1: full-frame compression restoration and super-resolution."
+                    "Stage: fal.ai full-photo restoration."
                 )
                 tg_file = await context.bot.get_file(file_id)
                 raw = bytes(await tg_file.download_as_bytearray())
@@ -237,20 +202,22 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=(
                         f"✅ Restored photo {index}/{len(batch)}\n"
                         f"Output: {dimensions[0]} × {dimensions[1]} px\n"
-                        "Model: Swin2SR (compressed_sr)\n"
+                        "Model: fal.ai Photo Restoration\n"
                         "Original background retained; no background removal."
-                    ),
+                    )
                 )
                 success += 1
             except Exception as exc:
                 failed += 1
                 log.exception("Photo %s processing failed", index)
-                error_text = str(exc).replace(REPLICATE_API_TOKEN, "[hidden token]")
-                await msg.reply_text(f"❌ Photo {index} failed.\nError: {error_text[:450]}")
+                safe_error = str(exc).replace(FAL_KEY, "[hidden token]")
+                await msg.reply_text(f"❌ Photo {index} failed.\nError: {safe_error[:450]}")
     finally:
         processing_users.discard(user_id)
+
     await status_msg.edit_text(
-        f"🏁 Batch finished!\n✅ Successful: {success}\n❌ Failed: {failed}\n\nSend another batch whenever ready."
+        f"🏁 Batch finished!\n✅ Successful: {success}\n❌ Failed: {failed}\n\n"
+        "Send another batch whenever ready."
     )
 
 
@@ -276,8 +243,8 @@ async def error_handler(update, context):
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing from Render Environment.")
-    if not REPLICATE_API_TOKEN:
-        raise RuntimeError("REPLICATE_API_TOKEN is missing from Render Environment.")
+    if not FAL_KEY:
+        raise RuntimeError("FAL_KEY is missing from Render Environment.")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("done", done))
