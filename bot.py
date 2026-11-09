@@ -1,259 +1,235 @@
 import os
 import io
-import time
-import base64
 import asyncio
 import logging
+import tempfile
+import time
 import threading
+from pathlib import Path
 
+import replicate
 import requests
 from PIL import Image, ImageOps
 from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    ContextTypes, filters
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-FAL_KEY = os.getenv("FAL_KEY", "").strip()
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "15"))
-MAX_BATCH_PHOTOS = int(os.getenv("MAX_BATCH_PHOTOS", "30"))
+BOT_TOKEN = os.getenv('BOT_TOKEN', '').strip()
+REPLICATE_API_TOKEN = os.getenv('REPLICATE_API_TOKEN', '').strip()
+MAX_UPLOAD_MB = int(os.getenv('MAX_UPLOAD_MB', '15'))
+MAX_BATCH_PHOTOS = int(os.getenv('MAX_BATCH_PHOTOS', '20'))
+MIN_SECONDS_BETWEEN_CALLS = float(os.getenv('MIN_SECONDS_BETWEEN_CALLS', '12'))
 
-# Fal.ai photo restoration endpoint. No Replicate, Gemini, NAFNet or Swin2SR.
-FAL_MODEL = "fal-ai/image-editing/photo-restoration"
-FAL_QUEUE_BASE = "https://queue.fal.run"
-FAL_TIMEOUT_SECONDS = int(os.getenv("FAL_TIMEOUT_SECONDS", "900"))
-FAL_POLL_INTERVAL = float(os.getenv("FAL_POLL_INTERVAL", "2.5"))
+BRIA_MODEL = 'bria/increase-resolution'
+GFPGAN_MODEL = 'tencentarc/gfpgan:0fbacf7afc6c144e5be9767cff80f25aff23e52b0708f17e20f9879b2f21516c'
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
-log = logging.getLogger("brothers-photo-bot")
-_fal_lock = threading.Lock()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+log = logging.getLogger('brothers-photo-bot')
+_call_lock = threading.Lock()
+_last_call = 0.0
+if REPLICATE_API_TOKEN:
+    os.environ['REPLICATE_API_TOKEN'] = REPLICATE_API_TOKEN
 
 
-def _fal_headers():
-    if not FAL_KEY:
-        raise RuntimeError("FAL_KEY is missing in Render Environment.")
-    return {"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"}
+def output_to_bytes(output):
+    if isinstance(output, (bytes, bytearray)):
+        return bytes(output)
+    if hasattr(output, 'read'):
+        data = output.read()
+        if data:
+            return data
+    if isinstance(output, (list, tuple)) and output:
+        return output_to_bytes(output[0])
+    if isinstance(output, str) and output.startswith('http'):
+        r = requests.get(output, timeout=180); r.raise_for_status(); return r.content
+    url = getattr(output, 'url', None)
+    if callable(url): url = url()
+    if isinstance(url, str) and url.startswith('http'):
+        r = requests.get(url, timeout=180); r.raise_for_status(); return r.content
+    raise RuntimeError(f'Unexpected Replicate output type: {type(output).__name__}')
 
 
-def _response_json(response):
-    try:
-        data = response.json()
-    except Exception:
-        data = {"detail": response.text[:1000]}
-    if not response.ok:
-        message = data.get("detail") or data.get("message") or data
-        raise RuntimeError(f"fal.ai HTTP {response.status_code}: {message}")
-    return data
+def run_replicate(model, inputs):
+    global _last_call
+    with _call_lock:
+        gap = MIN_SECONDS_BETWEEN_CALLS - (time.monotonic() - _last_call)
+        if gap > 0:
+            time.sleep(gap)
+        _last_call = time.monotonic()
+        return output_to_bytes(replicate.run(model, input=inputs))
 
 
-def fal_restore(image_bytes):
-    """Submit a photo to fal.ai and wait for the restored image URL."""
-    # fal accepts a base64 data URI, so no public image hosting is needed.
-    mime = "image/jpeg"
-    try:
-        with Image.open(io.BytesIO(image_bytes)) as im:
-            mime = "image/png" if im.format == "PNG" else "image/jpeg"
-    except Exception:
-        pass
-    encoded = base64.b64encode(image_bytes).decode("ascii")
-    data_uri = f"data:{mime};base64,{encoded}"
-
-    payload = {
-        "image_url": data_uri,
-        "guidance_scale": 3.5,
-        "num_inference_steps": 30,
-        "output_format": "jpeg"
-    }
-
-    with _fal_lock:
-        submit_url = f"{FAL_QUEUE_BASE}/{FAL_MODEL}"
-        submit = requests.post(
-            submit_url, headers=_fal_headers(), json=payload, timeout=120
-        )
-        submitted = _response_json(submit)
-        request_id = submitted.get("request_id")
-        if not request_id:
-            raise RuntimeError(f"fal.ai did not return request_id: {submitted}")
-
-        status_url = f"{FAL_QUEUE_BASE}/{FAL_MODEL}/requests/{request_id}/status"
-        result_url = f"{FAL_QUEUE_BASE}/{FAL_MODEL}/requests/{request_id}"
-        deadline = time.monotonic() + FAL_TIMEOUT_SECONDS
-
-        while time.monotonic() < deadline:
-            status_response = requests.get(
-                status_url, headers={"Authorization": f"Key {FAL_KEY}"}, timeout=60
-            )
-            status_data = _response_json(status_response)
-            state = status_data.get("status", "").upper()
-
-            if state == "COMPLETED":
-                result_response = requests.get(
-                    result_url, headers={"Authorization": f"Key {FAL_KEY}"}, timeout=120
-                )
-                result_data = _response_json(result_response)
-                images = result_data.get("images") or []
-                if not images or not images[0].get("url"):
-                    raise RuntimeError(f"fal.ai completed but returned no image: {result_data}")
-                image_response = requests.get(images[0]["url"], timeout=180)
-                image_response.raise_for_status()
-                return image_response.content
-
-            if state in {"FAILED", "CANCELLED"}:
-                raise RuntimeError(f"fal.ai job {state}: {status_data}")
-
-            time.sleep(FAL_POLL_INTERVAL)
-
-    raise TimeoutError(f"fal.ai job timed out after {FAL_TIMEOUT_SECONDS} seconds")
+def passport_crop(image, width=413, height=531):
+    """Centered 35x45mm @300dpi crop. User should verify headroom before official use."""
+    image = ImageOps.exif_transpose(image).convert('RGB')
+    target_ratio = width / height
+    ratio = image.width / image.height
+    if ratio > target_ratio:
+        new_w = int(image.height * target_ratio)
+        left = (image.width - new_w) // 2
+        image = image.crop((left, 0, left + new_w, image.height))
+    else:
+        new_h = int(image.width / target_ratio)
+        top = max(0, (image.height - new_h) // 2)
+        image = image.crop((0, top, image.width, top + new_h))
+    return image.resize((width, height), Image.Resampling.LANCZOS)
 
 
-def normalize_output(restored_bytes, original_bytes):
-    """Keep the original photo's exact pixel dimensions and avoid border bars."""
-    with Image.open(io.BytesIO(original_bytes)) as original:
-        original = ImageOps.exif_transpose(original)
-        target_size = original.size
+def enhance_photo(original_bytes, make_passport=False):
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        input_path = td / 'input.jpg'
+        input_path.write_bytes(original_bytes)
+        with Image.open(input_path) as im:
+            original = ImageOps.exif_transpose(im).convert('RGB')
+            original_size = original.size
+            normalized = td / 'normalized.jpg'
+            original.save(normalized, 'JPEG', quality=96)
 
-    with Image.open(io.BytesIO(restored_bytes)) as restored:
-        restored = ImageOps.exif_transpose(restored).convert("RGB")
-        # Resize directly to the original canvas. This avoids adding gray/black bars.
-        if restored.size != target_size:
-            restored = restored.resize(target_size, Image.Resampling.LANCZOS)
-        output = io.BytesIO()
-        restored.save(output, "JPEG", quality=95, subsampling=0, optimize=True)
-        return output.getvalue(), target_size
+        # Bria preserves image content and upscales without generative re-creation.
+        with open(normalized, 'rb') as f:
+            bria_bytes = run_replicate(BRIA_MODEL, {
+                'image': f,
+                'desired_increase': 2,
+                'preserve_alpha': False,
+                'sync': True,
+                'content_moderation': False,
+            })
 
+        bria_path = td / 'bria.png'
+        bria_path.write_bytes(bria_bytes)
 
-def enhance_photo(original_bytes):
-    restored = fal_restore(original_bytes)
-    return normalize_output(restored, original_bytes)
+        # GFPGAN is applied only after full-frame upscaling; v1.4 favors identity/detail.
+        with open(bria_path, 'rb') as f:
+            face_bytes = run_replicate(GFPGAN_MODEL, {
+                'img': f,
+                'version': 'v1.4',
+                'scale': 2,
+            })
+
+        with Image.open(io.BytesIO(face_bytes)) as im:
+            final = ImageOps.exif_transpose(im).convert('RGB')
+
+        if make_passport:
+            final = passport_crop(final)
+            dimensions = final.size
+        else:
+            # Retain the complete original frame and exact source dimensions; no border bars.
+            final = final.resize(original_size, Image.Resampling.LANCZOS)
+            dimensions = original_size
+
+        out = io.BytesIO()
+        final.save(out, 'JPEG', quality=95, subsampling=0, optimize=True)
+        return out.getvalue(), dimensions
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["batch"] = []
+    context.user_data['batch'] = []
+    context.user_data['passport_mode'] = False
     await update.effective_message.reply_text(
-        "👋 BROTHERS AI PHOTO RESTORER\n\n"
-        "Send photos, then /done to process.\n"
-        "Model: fal.ai Photo Restoration.\n"
-        "Original scene/background is retained; no background removal.\n"
-        "Output keeps each source photo's pixel dimensions.\n\n"
-        "/done — process queued photos\n"
-        "/cancel — clear queue\n"
-        "/status — check status"
+        '👋 BROTHERS PHOTO RESTORER\n\n'
+        'Send photos, then /done.\n'
+        'Models: Bria Increase Resolution + GFPGAN v1.4.\n'
+        'Original background retained; no background removal.\n\n'
+        '/passport — output 35x45mm (413x531 px) centered crop\n'
+        '/normal — retain original frame and dimensions\n'
+        '/done — process queue\n/cancel — clear queue\n/status — status'
     )
+
+
+async def passport(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['passport_mode'] = True
+    await update.effective_message.reply_text('🪪 Passport mode ON: centered 35×45mm, 413×531 px. Check headroom/crop before official use.')
+
+
+async def normal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['passport_mode'] = False
+    await update.effective_message.reply_text('Original-frame mode ON. Full photo and source dimensions will be retained.')
 
 
 async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     media = msg.photo[-1] if msg.photo else msg.document
-    if not media:
-        return
-    if msg.document and msg.document.mime_type and not msg.document.mime_type.startswith("image/"):
-        await msg.reply_text("Please send a JPG, PNG, or WEBP image.")
-        return
+    if not media: return
+    if msg.document and msg.document.mime_type and not msg.document.mime_type.startswith('image/'):
+        await msg.reply_text('Please send JPG, PNG or WEBP images.'); return
     if media.file_size and media.file_size > MAX_UPLOAD_MB * 1024 * 1024:
-        await msg.reply_text(f"Image too large. Maximum: {MAX_UPLOAD_MB} MB.")
-        return
-    batch = context.user_data.setdefault("batch", [])
+        await msg.reply_text(f'Image too large. Maximum: {MAX_UPLOAD_MB} MB.'); return
+    batch = context.user_data.setdefault('batch', [])
     if len(batch) >= MAX_BATCH_PHOTOS:
-        await msg.reply_text(f"Batch limit reached ({MAX_BATCH_PHOTOS}). Send /done.")
-        return
+        await msg.reply_text(f'Batch limit reached ({MAX_BATCH_PHOTOS}). Send /done.'); return
     batch.append(media.file_id)
-    await msg.reply_text(f"📥 Added: {len(batch)}/{MAX_BATCH_PHOTOS}. Send more or /done.")
+    await msg.reply_text(f'📥 Added: {len(batch)}/{MAX_BATCH_PHOTOS}. Send more or /done.')
 
 
 async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    batch = context.user_data.get("batch", [])
+    batch = context.user_data.get('batch', [])
     if not batch:
-        await msg.reply_text("No photos queued. Send photos first.")
-        return
-    if not FAL_KEY:
-        await msg.reply_text("❌ FAL_KEY is missing in Render Environment.")
-        return
-
-    processing_users = context.application.bot_data.setdefault("processing_users", set())
-    user_id = update.effective_user.id
-    if user_id in processing_users:
-        await msg.reply_text("⏳ Your previous batch is still processing. Please wait.")
-        return
-
-    processing_users.add(user_id)
-    context.user_data["batch"] = []
-    status_msg = await msg.reply_text(f"⏳ Starting {len(batch)} photo(s) with fal.ai...")
-    success = 0
-    failed = 0
+        await msg.reply_text('No photos queued. Send photos first.'); return
+    if not REPLICATE_API_TOKEN:
+        await msg.reply_text('❌ REPLICATE_API_TOKEN is missing in Render Environment.'); return
+    active = context.application.bot_data.setdefault('processing_users', set())
+    uid = update.effective_user.id
+    if uid in active:
+        await msg.reply_text('⏳ Your previous batch is still processing.'); return
+    active.add(uid)
+    context.user_data['batch'] = []
+    passport_mode = context.user_data.get('passport_mode', False)
+    status_msg = await msg.reply_text(f'⏳ Starting {len(batch)} photo(s). Models: Bria + GFPGAN...')
+    success = failed = 0
     try:
-        for index, file_id in enumerate(batch, start=1):
+        for i, file_id in enumerate(batch, 1):
             try:
-                await status_msg.edit_text(
-                    f"⏳ Processing photo {index}/{len(batch)}\n"
-                    f"✅ Completed: {success} | ❌ Failed: {failed}\n"
-                    "Stage: fal.ai full-photo restoration."
-                )
+                await status_msg.edit_text(f'⏳ Processing {i}/{len(batch)}\n✅ Completed: {success} | ❌ Failed: {failed}\nStage 1: Bria upscaling; Stage 2: GFPGAN face restoration.')
                 tg_file = await context.bot.get_file(file_id)
                 raw = bytes(await tg_file.download_as_bytearray())
-                result, dimensions = await asyncio.to_thread(enhance_photo, raw)
+                result, dims = await asyncio.to_thread(enhance_photo, raw, passport_mode)
                 await msg.reply_document(
                     document=io.BytesIO(result),
-                    filename=f"brothers_restored_{index}.jpg",
-                    caption=(
-                        f"✅ Restored photo {index}/{len(batch)}\n"
-                        f"Output: {dimensions[0]} × {dimensions[1]} px\n"
-                        "Model: fal.ai Photo Restoration\n"
-                        "Original background retained; no background removal."
-                    )
+                    filename=f'brothers_restored_{i}.jpg',
+                    caption=(f'✅ Restored {i}/{len(batch)}\nOutput: {dims[0]} × {dims[1]} px\nModels: Bria + GFPGAN v1.4\n' + ('Passport crop: 35×45mm (centered; verify crop).' if passport_mode else 'Original frame/background retained; no background removal.'))
                 )
                 success += 1
             except Exception as exc:
                 failed += 1
-                log.exception("Photo %s processing failed", index)
-                safe_error = str(exc).replace(FAL_KEY, "[hidden token]")
-                await msg.reply_text(f"❌ Photo {index} failed.\nError: {safe_error[:450]}")
+                log.exception('Photo %s failed', i)
+                err = str(exc).replace(REPLICATE_API_TOKEN, '[hidden token]')
+                await msg.reply_text(f'❌ Photo {i} failed.\nError: {err[:450]}')
     finally:
-        processing_users.discard(user_id)
-
-    await status_msg.edit_text(
-        f"🏁 Batch finished!\n✅ Successful: {success}\n❌ Failed: {failed}\n\n"
-        "Send another batch whenever ready."
-    )
+        active.discard(uid)
+    await status_msg.edit_text(f'🏁 Batch finished!\n✅ Successful: {success}\n❌ Failed: {failed}')
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    count = len(context.user_data.get("batch", []))
-    context.user_data["batch"] = []
-    await update.effective_message.reply_text(f"🗑️ Cleared {count} queued photo(s).")
+    n = len(context.user_data.get('batch', [])); context.user_data['batch'] = []
+    await update.effective_message.reply_text(f'🗑️ Cleared {n} queued photo(s).')
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    processing_users = context.application.bot_data.setdefault("processing_users", set())
-    active = update.effective_user.id in processing_users
-    queued = len(context.user_data.get("batch", []))
+    active = context.application.bot_data.setdefault('processing_users', set())
     await update.effective_message.reply_text(
-        f"🟢 Bot is running.\nQueued photos: {queued}\nProcessing: {'Yes' if active else 'No'}"
+        f"🟢 Bot running.\nQueued: {len(context.user_data.get('batch', []))}\nProcessing: {'Yes' if update.effective_user.id in active else 'No'}\nPassport mode: {'ON' if context.user_data.get('passport_mode') else 'OFF'}"
     )
 
 
 async def error_handler(update, context):
-    log.exception("Unhandled Telegram handler error", exc_info=context.error)
+    log.exception('Unhandled Telegram handler error', exc_info=context.error)
 
 
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing from Render Environment.")
-    if not FAL_KEY:
-        raise RuntimeError("FAL_KEY is missing from Render Environment.")
+    if not BOT_TOKEN: raise RuntimeError('BOT_TOKEN is missing from Render Environment.')
+    if not REPLICATE_API_TOKEN: raise RuntimeError('REPLICATE_API_TOKEN is missing from Render Environment.')
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("done", done))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('passport', passport))
+    app.add_handler(CommandHandler('normal', normal))
+    app.add_handler(CommandHandler('done', done))
+    app.add_handler(CommandHandler('cancel', cancel))
+    app.add_handler(CommandHandler('status', status))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, receive_photo))
     app.add_error_handler(error_handler)
     app.run_polling(drop_pending_updates=True)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
