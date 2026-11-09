@@ -156,7 +156,7 @@ def enhance_photo(original_bytes):
         nafnet_bytes = run_model(
             NAFNET_MODEL,
             safe_path,
-            {"task_type": "Image Debluring (GoPro)"},
+            {"task_type": "Image Debluring"},
             image_field="image",
         )
         nafnet_path = tmp / "nafnet.png"
