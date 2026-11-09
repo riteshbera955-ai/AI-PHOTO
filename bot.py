@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-KYC Portrait Generator – Fixed & Weaponised
-Uses stable-diffusion-img2img for style transfer, briaai/rmbg-1.4 for background removal,
-and stable-diffusion-inpainting for KYC markers.
+KYC Portrait Generator – Clean & Working
+Uses:
+- CodeFormer (face restore)
+- Real-ESRGAN (upscale)
+- SD img2img (style transfer)
+- SD inpainting (add sindoor, bindi, jewellery)
+- Bria RMGB-1.4 (background removal)
 """
 
 import asyncio
@@ -21,7 +25,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
 
-# ---------- CONFIG ----------
+# ---------- CONFIGURATION ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "").strip()
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "15"))
@@ -37,7 +41,7 @@ MAX_RETRIES = 6
 _req_lock = threading.Lock()
 _last_pred = 0.0
 
-# Prompts that burn the target look into the image
+# Style prompts (match WA0009.jpg)
 STYLE_PROMPT = (
     "A beautiful Indian woman wearing light grey dupatta with heavy gold embroidery "
     "floral paisley, matching grey saree, sindoor in hair, red bindi, gold nose stud, "
@@ -46,6 +50,7 @@ STYLE_PROMPT = (
 )
 NEG_PROMPT = "watermark, logo, text, cartoon, 3d, blurry, ugly, blemish, scar"
 
+# Inpainting prompts for missing markers
 INPAINT_PROMPTS = {
     "bindi": "bright red bindi on forehead, realistic",
     "sindoor": "thick red sindoor in hair parting, natural",
@@ -59,7 +64,7 @@ if REPLICATE_API_TOKEN:
     os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
 
 
-# ---------- HELPERS ----------
+# ---------- HELPER FUNCTIONS ----------
 def gpu_safe(input_path, output_path, max_px=GPU_MAX_PIXELS):
     with Image.open(input_path) as im:
         im = ImageOps.exif_transpose(im).convert("RGB")
@@ -108,8 +113,7 @@ def run_model(model_ref, image_path, extra_inputs, image_field="image"):
     raise RuntimeError("All retries exhausted")
 
 
-# ---------- MODELS (PUBLIC & ACCESSIBLE) ----------
-# Face restoration – sczhou/codeformer (public)
+# ---------- AI MODELS ----------
 def restore_face(file_path):
     return run_model(
         "sczhou/codeformer:cc4956dd26fa5a7185d5660cc9100fab1b8070a1d1654a8bb5eb6d443b020bb2",
@@ -117,11 +121,9 @@ def restore_face(file_path):
                      "face_upsample": True, "upscale": 2}
     )
 
-# Upscale – nightmareai/real-esrgan (public, no version needed)
 def upscale(file_path):
     return run_model("nightmareai/real-esrgan", file_path, {"scale": 4, "face_enhance": False})
 
-# Style transfer – stability-ai/stable-diffusion-img2img (public, no version)
 def style_transfer(file_path):
     return run_model(
         "stability-ai/stable-diffusion-img2img",
@@ -131,11 +133,10 @@ def style_transfer(file_path):
             "negative_prompt": NEG_PROMPT,
             "num_inference_steps": 25,
             "guidance_scale": 7.5,
-            "strength": 0.6,   # keep shape, change style
+            "strength": 0.6,
         }
     )
 
-# Inpainting – stability-ai/stable-diffusion-inpainting (public)
 INPAINT_MODEL = "stability-ai/stable-diffusion-inpainting:95b7223104132402a9ae91cc44a2809b8e000636d59b12a3ad3761f74ceee6df"
 
 def inpaint_region(image_bytes, mask_rects, prompt):
@@ -160,7 +161,7 @@ def inpaint_region(image_bytes, mask_rects, prompt):
         )
 
 def add_markers(img_bytes):
-    # work on 768x1024 for consistent coordinates
+    # Work on 768x1024 for consistent coordinates
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         raw = d / "raw.jpg"; raw.write_bytes(img_bytes)
@@ -180,7 +181,6 @@ def add_markers(img_bytes):
         img_bytes = inpaint_region(img_bytes, necklace_mask, INPAINT_PROMPTS["necklace"])
         return img_bytes
 
-# Watermark removal – same inpainting
 def remove_watermark(img_bytes):
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
@@ -202,27 +202,11 @@ def remove_watermark(img_bytes):
             }
         )
 
-# Background removal – briaai/rmbg-1.4 (public)
-def remove_bg(img_bytes):
-    with tempfile.TemporaryDirectory() as d:
-        d = Path(d)
-        inp = d / "bg_inp.jpg"
-        make_gpu_safe(io.BytesIO(img_bytes), inp)  # no gpu_safe function yet, we'll use the global one
-        gpu_safe_input = d / "gpu_safe.jpg"
-        make_gpu_safe(inp, gpu_safe_input)  # correct call
-        transparent = run_model("briaai/rmbg-1.4", gpu_safe_input, {}, image_field="image")
-        return transparent
-
-# Custom make_gpu_safe already defined above; we'll use the global gpu_safe function.
-# But the remove_bg above used make_gpu_safe; we should adjust the call to use the global gpu_safe.
-# Let's refactor remove_bg to directly use the bytes.
 def remove_bg_fixed(img_bytes):
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
-        inp = d / "bg_inp.jpg"
-        inp.write_bytes(img_bytes)
-        gpu_safe_path = d / "gpu_safe.jpg"
-        gpu_safe(inp, gpu_safe_path)
+        inp = d / "bg_inp.jpg"; inp.write_bytes(img_bytes)
+        gpu_safe_path = d / "gpu_safe.jpg"; gpu_safe(inp, gpu_safe_path)
         transparent = run_model("briaai/rmbg-1.4", gpu_safe_path, {}, image_field="image")
         return transparent
 
@@ -274,25 +258,99 @@ def enhance_and_generate(original_bytes):
         return out.getvalue(), final.size
 
 
-# ---------- TELEGRAM HANDLERS (unchanged) ----------
-async def start(update, context): ...        # same
-async def recv_photo(update, context): ...   # same
-async def done(update, context): ...         # same
-async def cancel(update, context): ...       # same
-async def status_cmd(update, context): ...   # same
-async def err(update, context): ...          # same
+# ---------- TELEGRAM BOT HANDLERS ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["batch"] = []
+    await update.message.reply_text(
+        "👮‍♂️ KYC Portrait Generator\n\n"
+        "Send photos one by one or as an album, then /done.\n"
+        "Output: traditional Indian portrait, 1030×1536 JPG, grey background.\n"
+        "All KYC markers (sindoor, bindi, jewellery) are added automatically.\n\n"
+        "/done — process queue\n"
+        "/cancel — clear queue\n"
+        "/status — check bot health"
+    )
 
-def main():
-    if not BOT_TOKEN or not REPLICATE_API_TOKEN:
-        raise RuntimeError("Missing env vars")
+async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    media = msg.photo[-1] if msg.photo else msg.document
+    if not media:
+        return
+    if msg.document and msg.document.mime_type and not msg.document.mime_type.startswith("image/"):
+        await msg.reply_text("Only images allowed.")
+        return
+    if media.file_size and media.file_size > MAX_UPLOAD_MB * 1024 * 1024:
+        await msg.reply_text(f"Too large – max {MAX_UPLOAD_MB} MB.")
+        return
+
+    batch = context.user_data.setdefault("batch", [])
+    if len(batch) >= MAX_BATCH_PHOTOS:
+        await msg.reply_text(f"Queue full ({MAX_BATCH_PHOTOS}). Send /done.")
+        return
+
+    batch.append(media.file_id)
+    await msg.reply_text(f"📥 Added ({len(batch)}/{MAX_BATCH_PHOTOS}). Send more or /done.")
+
+async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    batch = context.user_data.get("batch", [])
+    if not batch:
+        await msg.reply_text("No photos queued.")
+        return
+    if not REPLICATE_API_TOKEN:
+        await msg.reply_text("❌ REPLICATE_API_TOKEN missing in environment.")
+        return
+
+    context.user_data["batch"] = []
+    status_msg = await msg.reply_text(f"⏳ Processing {len(batch)} photo(s)...")
+    success, failed = 0, 0
+
+    for idx, file_id in enumerate(batch, 1):
+        try:
+            await status_msg.edit_text(f"⏳ Processing {idx}/{len(batch)} – ✅ {success} ❌ {failed}")
+            tg_file = await context.bot.get_file(file_id)
+            raw = bytes(await tg_file.download_as_bytearray())
+            result_bytes, dims = await asyncio.to_thread(enhance_and_generate, raw)
+            await msg.reply_document(
+                document=io.BytesIO(result_bytes),
+                filename=f"kyc_portrait_{idx}.jpg",
+                caption=f"✅ Done {idx}/{len(batch)}\nSize: {dims[0]}×{dims[1]}"
+            )
+            success += 1
+        except Exception as ex:
+            failed += 1
+            log.exception(f"Photo {idx} failed")
+            await msg.reply_text(f"❌ Photo {idx} error: {str(ex)[:400]}\nCheck logs.")
+
+    await status_msg.edit_text(f"🏁 Batch complete – ✅ {success} / ❌ {failed}")
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    count = len(context.user_data.get("batch", []))
+    context.user_data["batch"] = []
+    await update.message.reply_text(f"🗑 Cleared {count} photo(s).")
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🟢 Bot is running.")
+
+async def error_handler(update, context):
+    log.exception("Telegram error", exc_info=context.error)
+
+
+# ---------- MAIN ENTRY POINT ----------
+async def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("done", done))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, recv_photo))
-    app.add_error_handler(err)
-    app.run_polling(drop_pending_updates=True)
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, receive_photo))
+    app.add_error_handler(error_handler)
+
+    # Ensure no leftover webhook
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    await app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    main()
+    if not BOT_TOKEN or not REPLICATE_API_TOKEN:
+        raise RuntimeError("Set BOT_TOKEN and REPLICATE_API_TOKEN environment variables.")
+    asyncio.run(main())
