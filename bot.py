@@ -273,48 +273,50 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success = 0
     failed = 0
 
-    for index, file_id in enumerate(batch, start=1):
-        try:
-            await status_msg.edit_text(
-                f"⏳ Processing photo {index}/{len(batch)}\n"
-                f"✅ Completed: {success} | ❌ Failed: {failed}\n"
-                "API requests are spaced out; throttled requests retry automatically."
-            )
-
-            tg_file = await context.bot.get_file(file_id)
-            raw = bytes(await tg_file.download_as_bytearray())
-
-            result_bytes, dimensions = await asyncio.to_thread(
-                enhance_photo_keep_background, raw
-            )
-
-            await msg.reply_document(
-                document=io.BytesIO(result_bytes),
-                filename=f"brothers_1030x1536_{index}.jpg",
-                caption=(
-                    f"✅ Enhanced photo {index}/{len(batch)}\n"
-                    f"Output: {dimensions[0]} × {dimensions[1]} px\n"
-                    "Background: Original background retained (no background-removal model).\n"
-                    f"Face restoration fidelity: {CODEFORMER_FIDELITY:.2f}\n"
-                    "Visible frame retained; no crop, stretch or invented body/clothing."
+    try:
+        for index, file_id in enumerate(batch, start=1):
+            try:
+                await status_msg.edit_text(
+                    f"⏳ Processing photo {index}/{len(batch)}\n"
+                    f"✅ Completed: {success} | ❌ Failed: {failed}\n"
+                    "API requests are spaced out; throttled requests retry automatically."
                 )
-            )
-            success += 1
 
-        except Exception as exc:
-            failed += 1
-            log.exception("Photo %s processing failed", index)
-            error_text = str(exc)
-            if REPLICATE_API_TOKEN:
-                error_text = error_text.replace(REPLICATE_API_TOKEN, "[hidden token]")
-            await msg.reply_text(
-                f"❌ Photo {index} failed.\n"
-                f"Error: {error_text[:450]}\n"
-                "If this is an API rate/credit limit, the bot has retried automatically. "
-                "Check Replicate Billing/Usage and Render Logs."
-            )
+                tg_file = await context.bot.get_file(file_id)
+                raw = bytes(await tg_file.download_as_bytearray())
 
-    processing_users.discard(user_id)
+                result_bytes, dimensions = await asyncio.to_thread(
+                    enhance_photo_keep_background, raw
+                )
+
+                await msg.reply_document(
+                    document=io.BytesIO(result_bytes),
+                    filename=f"brothers_1030x1536_{index}.jpg",
+                    caption=(
+                        f"✅ Enhanced photo {index}/{len(batch)}\n"
+                        f"Output: {dimensions[0]} × {dimensions[1]} px\n"
+                        "Background: Original background retained (no background-removal model).\n"
+                        f"Face restoration fidelity: {CODEFORMER_FIDELITY:.2f}\n"
+                        "Visible frame retained; no crop, stretch or invented body/clothing."
+                    )
+                )
+                success += 1
+
+            except Exception as exc:
+                failed += 1
+                log.exception("Photo %s processing failed", index)
+                error_text = str(exc)
+                if REPLICATE_API_TOKEN:
+                    error_text = error_text.replace(REPLICATE_API_TOKEN, "[hidden token]")
+                await msg.reply_text(
+                    f"❌ Photo {index} failed.\n"
+                    f"Error: {error_text[:450]}\n"
+                    "If this is an API rate/credit limit, the bot has retried automatically. "
+                    "Check Replicate Billing/Usage and Render Logs."
+                )
+    finally:
+        processing_users.discard(user_id)
+
     await status_msg.edit_text(
         f"🏁 Batch finished!\n"
         f"✅ Successful: {success}\n"
