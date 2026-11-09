@@ -41,6 +41,30 @@ if REPLICATE_API_TOKEN:
     os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
 
 
+# GPU-safe intermediate limit. Keep a margin below the 2,096,704-pixel
+# hardware limit reported by Replicate.
+GPU_MAX_PIXELS = int(os.getenv("GPU_MAX_PIXELS", "1800000"))
+
+
+def make_gpu_safe_image(input_path, output_path, max_pixels=GPU_MAX_PIXELS):
+    """Resize an image under the model GPU pixel limit without cropping."""
+    with Image.open(input_path) as image:
+        image = ImageOps.exif_transpose(image).convert("RGB")
+        width, height = image.size
+        pixels = width * height
+
+        if pixels > max_pixels:
+            scale = (max_pixels / float(pixels)) ** 0.5
+            new_size = (
+                max(1, int(width * scale)),
+                max(1, int(height * scale)),
+            )
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
+
+        image.save(output_path, format="JPEG", quality=95, optimize=True)
+    return output_path
+
+
 def output_to_bytes(output):
     if isinstance(output, (bytes, bytearray)):
         return bytes(output)
@@ -116,13 +140,18 @@ def enhance_and_remove_background(original_bytes):
         source_path = temp_dir / "input_image"
         source_path.write_bytes(original_bytes)
 
+        # Resize before the first AI model; the GPU limit applies to the
+        # input image, not only to the final output.
+        safe_source_path = temp_dir / "input_gpu_safe.jpg"
+        make_gpu_safe_image(source_path, safe_source_path)
+
         # Model 1: conservative face restoration. A high fidelity value keeps
         # the result closer to the input instead of aggressively redesigning it.
         # CodeFormer is a community model, so Replicate requires a pinned
         # version identifier rather than the unversioned owner/model slug.
         restored = run_replicate_model(
             "sczhou/codeformer:cc4956dd26fa5a7185d5660cc9100fab1b8070a1d1654a8bb5eb6d443b020bb2",
-            source_path,
+            safe_source_path,
             {
                 "codeformer_fidelity": CODEFORMER_FIDELITY,
                 "background_enhance": False,
@@ -133,33 +162,28 @@ def enhance_and_remove_background(original_bytes):
         )
         restored_path = temp_dir / "face_restored.png"
         restored_path.write_bytes(restored)
+        restored_gpu_safe_path = temp_dir / "face_restored_gpu_safe.jpg"
+        make_gpu_safe_image(restored_path, restored_gpu_safe_path)
 
         # Model 2: general 4x upscaling, with face enhancement disabled so it
         # does not run a second, more aggressive face-restoration pass.
         upscaled = run_replicate_model(
             "nightmareai/real-esrgan",
-            restored_path,
+            restored_gpu_safe_path,
             {"scale": 4, "face_enhance": False}
         )
         upscale_path = temp_dir / "upscaled.png"
         upscale_path.write_bytes(upscaled)
 
-        # Limit the intermediate image before background removal to avoid
-        # unnecessarily huge API inputs; final output is still 4K long-edge.
-        with Image.open(upscale_path) as up_im:
-            up_im = ImageOps.exif_transpose(up_im).convert("RGB")
-            cap = OUTPUT_LONG_EDGE / max(up_im.size)
-            if cap < 1:
-                up_im = up_im.resize(
-                    (max(1, round(up_im.width * cap)), max(1, round(up_im.height * cap))),
-                    Image.Resampling.LANCZOS,
-                )
-            up_im.save(upscale_path, format="PNG", optimize=True)
+        # Background-removal model also has a GPU pixel limit. Cap by total
+        # pixels (not only the longest edge) before calling Bria.
+        bria_input_path = temp_dir / "bria_input_gpu_safe.jpg"
+        make_gpu_safe_image(upscale_path, bria_input_path)
 
         # Model 3: remove background and preserve alpha for a clean grey composite.
         transparent = run_replicate_model(
             "bria/remove-background",
-            upscale_path,
+            bria_input_path,
             {"preserve_alpha": True, "content_moderation": False}
         )
 
@@ -204,6 +228,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 BROTHERS AI PHOTO ENHANCER\n\n"
         "Send photos one by one or as an album, then send /done.\n"
         "Output: conservative face restoration, 4x upscaling and smooth grey background.\n"
+        "Large inputs are automatically resized for GPU safety without cropping.\n"
         "Processing is sequential with automatic waiting/retry for API rate limits.\n\n"
         "/done — process queued photos\n"
         "/cancel — clear the queue\n"
